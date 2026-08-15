@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tragent"
+version = "0.1.0"
+description = "Durable AI agent system for US equity strategy research"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain",
+    "langchain-openai",
+    "langgraph-checkpoint-postgres",
+    "psycopg[binary,pool]",
+    "pydantic-settings",
+    "yfinance",
+    "exchange-calendars",
+    "fastapi",
+    "uvicorn",
+    "PyJWT",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "httpx",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q --capture=sys"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]

@@ -1,0 +1,27 @@
+# Local configuration and downloaded Windows metadata
+.env
+.env.*
+!.env.example
+*:Zone.Identifier
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Local environments and editors
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+.DS_Store
+
+# Generated project output
+artifacts/

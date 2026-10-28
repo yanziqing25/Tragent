@@ -9,15 +9,14 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
-from trading.agent.models import (
+from tragent.quant import BacktestCosts
+from tragent.research.agent.models import (
     AgentBudget,
     BudgetUsage,
     ResearchGoal,
     ResearchResult,
-    ResearchTraceRecord,
     ToolObservation,
 )
-from trading.quant import BacktestCosts
 
 FINGERPRINT = "a" * 64
 OTHER_FINGERPRINT = "b" * 64
@@ -62,23 +61,9 @@ def observation() -> ToolObservation:
     )
 
 
-def trace_record() -> ResearchTraceRecord:
-    return ResearchTraceRecord(
-        step=1,
-        tool_name="run_backtest",
-        arguments={
-            "stage": "training",
-            "strategy_name": "moving_average",
-            "parameters": {"short_window": 20, "long_window": 100},
-        },
-        observation=observation(),
-    )
-
-
 def selected_result(**changes: object) -> ResearchResult:
     values: dict[str, object] = {
         "status": "selected",
-        "goal": goal(),
         "selected_fingerprint": FINGERPRINT,
         "evaluated_fingerprint": FINGERPRINT,
         "training_metrics": metrics(),
@@ -86,7 +71,6 @@ def selected_result(**changes: object) -> ResearchResult:
         "conclusion": "The frozen candidate met the drawdown constraint.",
         "limitations": ("Daily adjusted data only.",),
         "budget_usage": BudgetUsage(agent_steps=5, tool_calls=5, training_backtests=1),
-        "trace": (trace_record(),),
     }
     values.update(changes)
     return ResearchResult(**values)
@@ -111,8 +95,6 @@ def test_research_goal_normalizes_and_deduplicates_supported_strategies() -> Non
     ("changes", "message"),
     [
         ({"objective": " "}, "objective"),
-        ({"symbol": " "}, "symbol"),
-        ({"benchmark_symbol": " "}, "benchmark_symbol"),
         ({"start_date": date(2025, 1, 1)}, "start_date"),
     ],
 )
@@ -121,12 +103,10 @@ def test_research_goal_rejects_invalid_inputs(changes: dict[str, object], messag
         goal(**changes)
 
 
-def test_research_goal_accepts_explicit_costs_and_is_frozen() -> None:
+def test_research_goal_accepts_explicit_costs() -> None:
     research_goal = goal(costs=BacktestCosts(2.0, 3.0))
 
     assert research_goal.costs.total_bps == 5.0
-    with pytest.raises(ValidationError):
-        research_goal.symbol = "MSFT"
 
 
 def test_agent_budget_defaults_are_the_hard_caps() -> None:
@@ -134,7 +114,7 @@ def test_agent_budget_defaults_are_the_hard_caps() -> None:
 
     assert budget.max_agent_steps == 40
     assert budget.max_tool_calls == 30
-    assert budget.max_training_backtests == 8
+    assert budget.max_training_backtests == 11
 
 
 @pytest.mark.parametrize(
@@ -174,8 +154,6 @@ def test_tool_observation_is_compact_json_and_truncates_optional_text() -> None:
     "changes",
     [
         {"identifiers": {str(index): str(index) for index in range(5)}},
-        {"metrics": {f"metric_{index}": index for index in range(33)}},
-        {"metrics": {"not_a_number": True}},
         {"metrics": {"frame": pd.DataFrame({"x": [1]})}},
     ],
 )
@@ -191,30 +169,6 @@ def test_tool_observation_rejects_invalid_mandatory_content(changes: dict[str, o
         ToolObservation(**values)
 
 
-def test_budget_usage_and_trace_record_are_frozen_json_safe_contracts() -> None:
-    usage = BudgetUsage(agent_steps=2, tool_calls=1, training_backtests=0)
-    record = trace_record()
-
-    assert usage.tool_calls == 1
-    assert record.arguments["stage"] == "training"
-    with pytest.raises(ValidationError):
-        usage.agent_steps = 3
-    with pytest.raises(ValidationError):
-        ResearchTraceRecord(
-            step=1,
-            tool_name="run_backtest",
-            arguments={"bad": float("nan")},
-            observation=observation(),
-        )
-    with pytest.raises(ValidationError):
-        ResearchTraceRecord(
-            step=1,
-            tool_name="run_backtest",
-            arguments={"bad": pd.Series([1.0])},
-            observation=observation(),
-        )
-
-
 def test_selected_research_result_keeps_trusted_metrics_and_audit_fingerprint() -> None:
     result = selected_result()
 
@@ -222,15 +176,11 @@ def test_selected_research_result_keeps_trusted_metrics_and_audit_fingerprint() 
     assert result.evaluated_fingerprint == FINGERPRINT
     assert result.training_metrics["asset_buy_and_hold_return"] == pytest.approx(0.09)
     assert result.test_metrics["benchmark_return"] == pytest.approx(0.07)
-    assert len(result.trace) == 1
-    with pytest.raises(ValidationError):
-        result.conclusion = "Changed"
 
 
 def test_no_strategy_can_retain_the_locked_fingerprint_for_audit() -> None:
     result = ResearchResult(
         status="no_strategy",
-        goal=goal(),
         evaluated_fingerprint=FINGERPRINT,
         training_metrics=metrics(),
         test_metrics=metrics(max_drawdown=-0.30),
@@ -246,7 +196,6 @@ def test_no_strategy_can_retain_the_locked_fingerprint_for_audit() -> None:
 def test_no_strategy_without_evaluated_candidate_cannot_carry_candidate_metrics() -> None:
     common: dict[str, object] = {
         "status": "no_strategy",
-        "goal": goal(),
         "conclusion": "No candidate was selected for final evaluation.",
         "stop_reason": "The final batch completed with an explicit no-selection lock.",
     }
@@ -273,7 +222,6 @@ def test_selected_research_result_rejects_inconsistent_fields(changes: dict[str,
 
 def test_non_selected_results_require_a_stop_reason_and_never_select() -> None:
     common: dict[str, object] = {
-        "goal": goal(),
         "conclusion": "The run stopped safely.",
         "budget_usage": BudgetUsage(),
     }

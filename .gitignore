@@ -10,8 +10,6 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
-.coverage
-htmlcov/
 build/
 dist/
 
@@ -25,3 +23,6 @@ env/
 
 # Generated project output
 artifacts/
+
+# Celery beat keeps its last run times here.
+celerybeat-schedule*

@@ -3,45 +3,49 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
-from datetime import date
-from pathlib import Path
+from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Literal
 
-import pandas as pd
 from langchain.agents import create_agent
-from langchain.agents.middleware import ModelCallLimitMiddleware, before_model
+from langchain.agents.middleware import ModelCallLimitMiddleware, after_model, before_model
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
-from trading.agent.critic import (
+from tragent.quant import BacktestCosts, PerformanceMetrics, RsiConfig, strategy_parameters
+from tragent.research.agent.critic import (
     MAX_CRITIC_AGENT_STEPS,
     MAX_CRITIC_TOOL_CALLS,
-    build_critic_messages,
+    critic_input_messages,
 )
-from trading.agent.harness import require_single_tool_call
-from trading.agent.models import (
+from tragent.research.agent.harness import (
+    TradingAgentState,
+    critic_prompt,
+    require_single_tool_call,
+    research_prompt,
+)
+from tragent.research.agent.models import (
     AgentBudget,
     CriticReview,
+    MarketContextEvidence,
     ResearchDraft,
     ResearchGoal,
     ToolObservation,
 )
-from trading.agent.prompt import build_research_messages
-from trading.agent.runtime import (
+from tragent.research.agent.prompt import research_input_messages
+from tragent.research.agent.retrieval import CONTEXT_SOURCES
+from tragent.research.agent.runtime import (
     backtest_fingerprint,
 )
-from trading.agent.tools import build_critic_tools, build_research_tools
-from trading.agent.workspace import CriticRoundRuntime, ResearchWorkspace, RuntimeEvent
-from trading.quant import (
-    BacktestCosts,
-    DataQualityReport,
-    DrawdownAnalysis,
-    FinalEvaluation,
-    PerformanceMetrics,
-    RsiConfig,
-    SegmentBacktestResult,
-    TrainingEvaluation,
+from tragent.research.agent.tools import build_critic_tools, build_research_tools
+from tragent.research.agent.workspace import (
+    CandidateRecord,
+    CriticRound,
+    DrawdownRecord,
+    ResearchGraphContext,
+    ResearchWorkspace,
+    SegmentRecord,
+    ToolCallRecord,
 )
 
 _RESEARCH_TOOL_NAMES = (
@@ -50,11 +54,13 @@ _RESEARCH_TOOL_NAMES = (
     "run_backtest",
     "analyze_drawdown",
     "compare_with_benchmark",
+    "search_market_context",
     "submit_research_draft",
 )
 _CRITIC_TOOL_NAMES = (
     "inspect_selected_drawdown",
     "compare_selected_with_benchmark",
+    "inspect_retrieved_context",
     "submit_critic_review",
 )
 
@@ -227,34 +233,19 @@ def _metrics(
     )
 
 
-def _segment(
-    segment: Literal["training", "test"], metrics: PerformanceMetrics
-) -> SegmentBacktestResult:
-    index = pd.date_range("2024-01-02" if segment == "training" else "2024-10-01", periods=4)
-    equity = pd.Series([1.0, 1.02, 0.98, 1.04], index=index)
-    asset = pd.Series([1.0, 1.01, 1.02, 1.03], index=index)
-    benchmark = pd.Series([1.0, 1.005, 1.015, 1.025], index=index)
-    zeros = pd.Series([0.0] * 4, index=index)
-    return SegmentBacktestResult(
-        segment=segment,
-        bar_returns=equity.pct_change().fillna(0.0),
-        equity_curve=equity,
-        drawdown_curve=pd.Series([0.0, 0.0, metrics.max_drawdown, -0.01], index=index),
-        positions=pd.Series([0, 1, 1, 0], index=index, dtype="int8"),
-        asset_buy_and_hold_bar_returns=asset.pct_change().fillna(0.0),
-        asset_buy_and_hold_equity_curve=asset,
-        asset_buy_and_hold_drawdown_curve=zeros,
-        benchmark_bar_returns=benchmark.pct_change().fillna(0.0),
-        benchmark_equity_curve=benchmark,
-        benchmark_drawdown_curve=zeros,
+def _segment(metrics: PerformanceMetrics) -> SegmentRecord:
+    return SegmentRecord(
         metrics=metrics,
-        drawdown=DrawdownAnalysis(metrics.max_drawdown, index[1], index[2], None, 2),
+        drawdown=DrawdownRecord(
+            max_drawdown=metrics.max_drawdown,
+            peak_date=datetime(2024, 3, 1),
+            trough_date=datetime(2024, 4, 1),
+            recovery_date=None,
+            underwater_bars=22,
+        ),
+        mean_exposure=0.5,
         warnings=("Synthetic Agent Eval evidence; not a historical backtest.",),
     )
-
-
-def _quality(symbol: str) -> DataQualityReport:
-    return DataQualityReport(symbol, 252, pd.Timestamp("2024-01-02"), pd.Timestamp("2024-12-31"))
 
 
 def _case_metrics(case_id: str) -> tuple[PerformanceMetrics, PerformanceMetrics]:
@@ -273,42 +264,47 @@ def _case_metrics(case_id: str) -> tuple[PerformanceMetrics, PerformanceMetrics]
     return training, test
 
 
-def _final_evaluation(case_id: str) -> FinalEvaluation:
-    training, test = _case_metrics(case_id)
-    config = RsiConfig(14, 30, 70)
-    return FinalEvaluation(
-        "AAPL",
-        "SPY",
-        "rsi",
-        config,
-        BacktestCosts(5, 5),
-        pd.Timestamp("2024-01-02"),
-        pd.Timestamp("2024-12-31"),
-        176,
-        pd.Timestamp("2024-09-16"),
-        _segment("training", training),
-        _segment("test", test),
-        _quality("AAPL"),
-        _quality("SPY"),
-        ("Synthetic Agent Eval evidence; not a historical backtest.",),
+def _candidate(
+    config: RsiConfig, training: PerformanceMetrics, test: PerformanceMetrics | None = None
+) -> CandidateRecord:
+    return CandidateRecord(
+        fingerprint=backtest_fingerprint(_goal(), config),
+        strategy_name="rsi",
+        parameters=strategy_parameters(config),
+        training=_segment(training),
+        test=None if test is None else _segment(test),
     )
 
 
-def _training_evaluation(final: FinalEvaluation) -> TrainingEvaluation:
-    return TrainingEvaluation(
-        final.symbol,
-        final.benchmark_symbol,
-        final.strategy_name,
-        final.config,
-        final.costs,
-        final.data_start,
-        final.data_end,
-        final.split_index,
-        final.split_date,
-        final.training,
-        final.asset_quality,
-        final.benchmark_quality,
-        final.warnings,
+def _context_evidence() -> tuple[MarketContextEvidence, ...]:
+    return (
+        MarketContextEvidence(
+            id="eval-sec",
+            source_type="official",
+            source="sec",
+            title="Synthetic SEC evidence",
+            excerpt="Synthetic official evidence for Agent policy evaluation.",
+            published_at="2024-12-20",
+            url="https://www.sec.gov/Archives/eval-sec",
+        ),
+        MarketContextEvidence(
+            id="eval-news",
+            source_type="news",
+            source="yahoo_finance",
+            title="Synthetic news evidence",
+            excerpt="Synthetic third-party news context for Agent policy evaluation.",
+            published_at="2024-12-21",
+            url="https://finance.yahoo.com/eval-news",
+        ),
+        MarketContextEvidence(
+            id="eval-community",
+            source_type="community",
+            source="stocktwits",
+            title="Synthetic community evidence",
+            excerpt="Synthetic unverified community sentiment for Agent policy evaluation.",
+            published_at="2024-12-22",
+            url="https://stocktwits.com/eval-community",
+        ),
     )
 
 
@@ -336,28 +332,28 @@ def _draft(case_id: str, fingerprint: str) -> ResearchDraft:
         selected_fingerprint=fingerprint,
         conclusion=conclusions[case_id],
         limitations=(limitation,),
+        market_context_summary=(
+            "Synthetic official, news, and community evidence is included only to test Critic "
+            "source handling; it does not change the deterministic result."
+        ),
+        cited_evidence_ids=("eval-sec", "eval-news", "eval-community"),
     )
 
 
-def _critic_workspace(case_id: str) -> tuple[ResearchWorkspace, CriticRoundRuntime]:
-    goal, final = _goal(), _final_evaluation(case_id)
-    fingerprint = backtest_fingerprint(goal, final.config)
-    training = _training_evaluation(final)
-    training_evaluations = {fingerprint: training}
+def _critic_workspace(case_id: str) -> ResearchWorkspace:
+    training, test = _case_metrics(case_id)
+    locked = _candidate(RsiConfig(14, 30, 70), training, test)
+    candidates = [locked]
     if case_id == "critic_consistent_accept":
-        alternative_config = RsiConfig(10, 25, 75)
-        training_evaluations[backtest_fingerprint(goal, alternative_config)] = replace(
-            training,
-            config=alternative_config,
-            training=_segment("training", _metrics(0.12, -0.13, 6, 0.08, 0.9)),
+        candidates.append(
+            _candidate(RsiConfig(10, 25, 75), _metrics(0.12, -0.13, 6, 0.08, 0.9), test)
         )
-    current = CriticRoundRuntime(draft=_draft(case_id, fingerprint))
-    rounds = [current]
+    rounds = [CriticRound(draft=_draft(case_id, locked.fingerprint))]
     if case_id == "critic_second_round_no_revise":
         rounds.insert(
             0,
-            CriticRoundRuntime(
-                draft=_draft(case_id, fingerprint),
+            CriticRound(
+                draft=_draft(case_id, locked.fingerprint),
                 review=CriticReview(
                     verdict="revise",
                     summary="The conclusion conflicts with the benchmark evidence.",
@@ -366,83 +362,78 @@ def _critic_workspace(case_id: str) -> tuple[ResearchWorkspace, CriticRoundRunti
                 ),
             ),
         )
-    return (
-        ResearchWorkspace(
-            goal,
-            AgentBudget(),
-            _NoNetworkProvider(),  # type: ignore[arg-type]
-            Path("/tmp/tragent-evals"),
-            current_candidate=final.config,
-            validated_configs={fingerprint: final.config},
-            training_evaluations=training_evaluations,
-            final_evaluations={fingerprint: final},
-            phase="locked",
-            locked_fingerprint=fingerprint,
-            final_batch_completed=True,
-            active_agent="critic",
-            critic_rounds=rounds,
-            training_backtests=len(training_evaluations),
-        ),
-        current,
+    return ResearchWorkspace(
+        goal=_goal(),
+        budget=AgentBudget(),
+        phase="locked",
+        active_agent="critic",
+        candidates=candidates,
+        locked_fingerprint=locked.fingerprint,
+        critic_rounds=rounds,
+        journal=[_market_context_record(_context_evidence())],
     )
 
 
-def _market_data_event() -> RuntimeEvent:
-    return RuntimeEvent(
-        "get_market_data",
-        {},
-        ToolObservation(
-            tool_name="get_market_data",
-            status="success",
-            summary="Synthetic aligned daily evidence is ready.",
-            identifiers={"symbol": "AAPL", "benchmark_symbol": "SPY"},
-        ),
-        "eval-market-data",
-        True,
-    )
+def _record(tool_name: str, arguments: dict[str, object], observation: ToolObservation):
+    return ToolCallRecord(step=1, tool_name=tool_name, arguments=arguments, observation=observation)
 
 
-def _statistics_event() -> RuntimeEvent:
-    return RuntimeEvent(
-        "calculate_asset_statistics",
-        {},
+def _market_context_record(evidence: tuple[MarketContextEvidence, ...]) -> ToolCallRecord:
+    return _record(
+        "search_market_context",
+        {"queries": dict.fromkeys(CONTEXT_SOURCES, "Synthetic Agent Eval market context")},
         ToolObservation(
-            tool_name="calculate_asset_statistics",
+            tool_name="search_market_context",
             status="success",
-            summary="Synthetic asset statistics are ready.",
-            identifiers={"symbol": "AAPL"},
+            summary="Synthetic context search covered every configured source.",
             metrics={
-                "observations": 252,
-                "total_return": 0.10,
-                "annualized_return": 0.10,
-                "annualized_volatility": 0.18,
-                "max_drawdown": -0.12,
+                "sec": 1,
+                "yahoo_finance": 1,
+                "stocktwits": 1,
+                "reddit": 0,
             },
+            evidence=evidence,
         ),
-        "eval-statistics",
-        True,
     )
 
 
 def _research_workspace(case_id: str) -> ResearchWorkspace:
-    goal = _goal()
-    workspace = ResearchWorkspace(
-        goal,
-        AgentBudget(),
-        _NoNetworkProvider(),  # type: ignore[arg-type]
-        Path("/tmp/tragent-evals"),
-        events=[_market_data_event(), _statistics_event()],
-    )
+    journal = [
+        _record(
+            "get_market_data",
+            {},
+            ToolObservation(
+                tool_name="get_market_data",
+                status="success",
+                summary="Synthetic aligned daily evidence is ready.",
+                identifiers={"symbol": "AAPL", "benchmark_symbol": "SPY"},
+            ),
+        ),
+        _record(
+            "calculate_asset_statistics",
+            {},
+            ToolObservation(
+                tool_name="calculate_asset_statistics",
+                status="success",
+                summary="Synthetic asset statistics are ready.",
+                identifiers={"symbol": "AAPL"},
+                metrics={
+                    "observations": 252,
+                    "total_return": 0.10,
+                    "annualized_return": 0.10,
+                    "annualized_volatility": 0.18,
+                    "max_drawdown": -0.12,
+                },
+            ),
+        ),
+    ]
+    workspace = ResearchWorkspace(goal=_goal(), budget=AgentBudget(), journal=journal)
     if case_id == "research_exact_candidate_repeat":
-        final = _final_evaluation("critic_consistent_accept")
-        fingerprint = backtest_fingerprint(goal, final.config)
-        training = _training_evaluation(final)
-        workspace.current_candidate = final.config
-        workspace.validated_configs[fingerprint] = final.config
-        workspace.training_evaluations[fingerprint] = training
-        workspace.training_backtests = 1
-        workspace.events.append(
-            RuntimeEvent(
+        candidate = _candidate(RsiConfig(14, 30, 70), _case_metrics("critic_consistent_accept")[0])
+        metrics = candidate.training.metrics
+        workspace.candidates.append(candidate)
+        workspace.journal.append(
+            _record(
                 "run_backtest",
                 {
                     "stage": "training",
@@ -458,46 +449,87 @@ def _research_workspace(case_id: str) -> ResearchWorkspace:
                     tool_name="run_backtest",
                     status="success",
                     summary="The synthetic RSI sample-in backtest completed.",
-                    identifiers={"fingerprint": fingerprint, "segment": "training"},
+                    identifiers={"fingerprint": candidate.fingerprint, "segment": "training"},
                     metrics={
-                        "total_return": training.training.metrics.total_return,
-                        "max_drawdown": training.training.metrics.max_drawdown,
-                        "trade_count": training.training.metrics.trade_count,
+                        "total_return": metrics.total_return,
+                        "max_drawdown": metrics.max_drawdown,
+                        "trade_count": metrics.trade_count,
                     },
                 ),
-                "eval-training",
-                True,
             )
         )
     return workspace
 
 
+def _context(model: BaseChatModel) -> ResearchGraphContext:
+    return ResearchGraphContext(
+        model=model,
+        provider=_NoNetworkProvider(),  # type: ignore[arg-type]
+        artifacts="evals",
+    )
+
+
+def _conversation(journal: list[ToolCallRecord]) -> list[BaseMessage]:
+    """Replay a synthetic journal as the ReAct conversation that produced it."""
+
+    messages: list[BaseMessage] = []
+    for index, record in enumerate(journal):
+        call_id = f"eval-call-{index}"
+        messages.append(
+            AIMessage(
+                content="",
+                tool_calls=[{"name": record.tool_name, "args": record.arguments, "id": call_id}],
+            )
+        )
+        messages.append(ToolMessage(record.observation.to_compact_json(), tool_call_id=call_id))
+    return messages
+
+
 def _run_research_case(case: AgentEvalCase, model: BaseChatModel) -> dict[str, object]:
     workspace = _research_workspace(case.case_id)
-    tools = build_research_tools(lambda: workspace)
-    response = model.bind_tools(tools, parallel_tool_calls=False, strict=False).invoke(
-        build_research_messages(workspace)
+    tools = build_research_tools()
+
+    @after_model(can_jump_to=["end"])
+    def stop_after_decision(_state: object, _runtime: object) -> dict[str, str]:
+        return {"jump_to": "end"}
+
+    agent = create_agent(
+        model=model,
+        tools=tools,
+        middleware=[require_single_tool_call, research_prompt, stop_after_decision],
+        state_schema=TradingAgentState,
+        context_schema=ResearchGraphContext,
+        name="research_eval_agent",
     )
-    actions = _accepted_actions(response, tools)
+    history = [*research_input_messages(workspace), *_conversation(workspace.journal)]
+    output = agent.invoke(
+        {"messages": history, "workspace": workspace.model_dump(mode="json")},
+        context=_context(model),
+    )
+    actions, decisions, valid_actions = _trajectory_actions(
+        output["messages"][len(history) :], tools
+    )
     return {
         "agent": "research",
         "actions": actions,
         "verdict": None,
-        "decisions": 1,
+        "decisions": decisions,
         "tool_calls": len(actions),
-        "protocol_valid": len(actions) == 1,
+        "protocol_valid": valid_actions and decisions == 1 and len(actions) == 1,
     }
 
 
 def _run_critic_case(case: AgentEvalCase, model: BaseChatModel) -> dict[str, object]:
-    workspace, review_round = _critic_workspace(case.case_id)
+    workspace = _critic_workspace(case.case_id)
+    review_round = workspace.critic_rounds[-1]
     review_round.agent_steps = MAX_CRITIC_AGENT_STEPS - case.max_decisions
     review_round.tool_calls = MAX_CRITIC_TOOL_CALLS - case.max_decisions
-    tools = build_critic_tools(lambda: workspace)
+    tools = build_critic_tools(workspace)
 
     @before_model(can_jump_to=["end"])
-    def stop_after_review(_state: object, _runtime: object) -> dict[str, str] | None:
-        return {"jump_to": "end"} if review_round.review is not None else None
+    def stop_after_review(state: TradingAgentState, _runtime: object) -> dict[str, str] | None:
+        reviewed = ResearchWorkspace.model_validate(state["workspace"]).critic_rounds[-1]
+        return {"jump_to": "end"} if reviewed.review is not None else None
 
     agent = create_agent(
         model=model,
@@ -505,21 +537,29 @@ def _run_critic_case(case: AgentEvalCase, model: BaseChatModel) -> dict[str, obj
         middleware=[
             stop_after_review,
             require_single_tool_call,
+            critic_prompt,
             ModelCallLimitMiddleware(run_limit=case.max_decisions),
         ],
+        state_schema=TradingAgentState,
+        context_schema=ResearchGraphContext,
         name="critic_eval_agent",
     )
-    output = agent.invoke({"messages": build_critic_messages(workspace, review_round)})
+    output = agent.invoke(
+        {
+            "messages": critic_input_messages(workspace),
+            "workspace": workspace.model_dump(mode="json"),
+        },
+        context=_context(model),
+    )
+    review = ResearchWorkspace.model_validate(output["workspace"]).critic_rounds[-1].review
     actions, decisions, valid_actions = _trajectory_actions(output.get("messages"), tools)
     return {
         "agent": "critic",
         "actions": actions,
-        "verdict": None if review_round.review is None else review_round.review.verdict,
+        "verdict": None if review is None else review.verdict,
         "decisions": decisions,
         "tool_calls": len(actions),
-        "protocol_valid": (
-            valid_actions and len(actions) == decisions and review_round.review is not None
-        ),
+        "protocol_valid": valid_actions and len(actions) == decisions and review is not None,
     }
 
 

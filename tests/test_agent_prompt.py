@@ -3,24 +3,39 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from types import SimpleNamespace
+from datetime import datetime
+from pathlib import Path
 
-import pandas as pd
-from langchain_core.messages import HumanMessage, SystemMessage, convert_to_openai_messages
+import pytest
+from langchain_core.messages import HumanMessage
 
-from trading.agent.critic import CRITIC_SYSTEM_PROMPT
-from trading.agent.models import (
+from tragent.quant import BacktestCosts, PerformanceMetrics
+from tragent.research.agent.models import (
     AgentBudget,
+    CriticReview,
+    MarketContextEvidence,
+    ResearchDraft,
     ResearchGoal,
-    ResearchTraceRecord,
     ToolObservation,
 )
-from trading.agent.prompt import SYSTEM_PROMPT, build_research_messages
-from trading.quant import BacktestCosts, MovingAverageConfig, RsiConfig
+from tragent.research.agent.prompt import (
+    SYSTEM_PROMPT,
+    research_input_messages,
+    research_system_prompt,
+)
+from tragent.research.agent.workspace import (
+    CandidateRecord,
+    CriticRound,
+    DrawdownRecord,
+    ResearchWorkspace,
+    SegmentRecord,
+    ToolCallRecord,
+)
 
 LOCKED_FINGERPRINT = "a" * 64
 OTHER_FINGERPRINT = "b" * 64
+MOVING_AVERAGE = {"short_window": 20, "long_window": 100}
+RSI = {"rsi_window": 14, "entry_threshold": 30, "exit_threshold": 70}
 
 
 def goal() -> ResearchGoal:
@@ -35,98 +50,65 @@ def goal() -> ResearchGoal:
     )
 
 
-def metrics(total_return: float, max_drawdown: float) -> SimpleNamespace:
-    return SimpleNamespace(
-        total_return=total_return,
-        annualized_return=total_return / 2,
-        annualized_volatility=0.15,
-        sharpe_ratio=0.5,
-        max_drawdown=max_drawdown,
-        trade_count=4,
-        turnover=7.0,
-        asset_buy_and_hold_return=0.09,
-        benchmark_return=0.07,
+def segment(total_return: float, max_drawdown: float, exposure: float) -> SegmentRecord:
+    return SegmentRecord(
+        metrics=PerformanceMetrics(
+            total_return=total_return,
+            annualized_return=total_return / 2,
+            annualized_volatility=0.15,
+            sharpe_ratio=0.5,
+            max_drawdown=max_drawdown,
+            trade_count=4,
+            turnover=7.0,
+            asset_buy_and_hold_return=0.09,
+            benchmark_return=0.07,
+        ),
+        drawdown=DrawdownRecord(
+            max_drawdown=max_drawdown,
+            peak_date=datetime(2021, 1, 4),
+            trough_date=datetime(2021, 3, 1),
+            recovery_date=None,
+            underwater_bars=40,
+        ),
+        mean_exposure=exposure,
+        warnings=(),
     )
 
 
-def training_evaluation(
-    config: MovingAverageConfig | RsiConfig,
+def candidate(
+    fingerprint: str,
+    parameters: dict[str, int],
     *,
     total_return: float,
-    max_drawdown: float,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        strategy_name=("moving_average" if isinstance(config, MovingAverageConfig) else "rsi"),
-        config=config,
-        training=SimpleNamespace(metrics=metrics(total_return, max_drawdown)),
+    max_drawdown: float = -0.10,
+    test_return: float | None = None,
+) -> CandidateRecord:
+    return CandidateRecord(
+        fingerprint=fingerprint,
+        strategy_name="moving_average" if "short_window" in parameters else "rsi",
+        parameters=parameters,
+        training=segment(total_return, max_drawdown, 0.2),
+        test=None if test_return is None else segment(test_return, -0.12, 0.15),
     )
 
 
-def final_evaluation(
-    config: MovingAverageConfig | RsiConfig,
-    *,
-    training_return: float,
-    test_return: float,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        strategy_name=("moving_average" if isinstance(config, MovingAverageConfig) else "rsi"),
-        config=config,
-        training=SimpleNamespace(metrics=metrics(training_return, -0.10)),
-        test=SimpleNamespace(metrics=metrics(test_return, -0.12)),
-    )
+def workspace(**changes: object) -> ResearchWorkspace:
+    return ResearchWorkspace(goal=goal(), budget=AgentBudget(), **changes)
 
 
-@dataclass(frozen=True, slots=True)
-class Event:
-    tool_name: str
-    normalized_arguments: dict[str, object]
-    observation: ToolObservation
-    tool_call_id: str | None = None
-    replayable: bool = False
-
-
-@dataclass(slots=True)
-class Workspace:
-    goal: ResearchGoal = field(default_factory=goal)
-    budget: AgentBudget = field(default_factory=AgentBudget)
-    phase: str = "researching"
-    current_candidate: MovingAverageConfig | RsiConfig | None = None
-    training_evaluations: dict[str, object] = field(default_factory=dict)
-    final_evaluations: dict[str, object] = field(default_factory=dict)
-    locked_fingerprint: str | None = None
-    final_batch_completed: bool = False
-    agent_steps: int = 0
-    tool_calls: int = 0
-    training_backtests: int = 0
-    trace: list[ResearchTraceRecord] = field(default_factory=list)
-    unresolved_issues: list[str] = field(default_factory=list)
-    events: list[Event] = field(default_factory=list)
-    aligned_data: object = field(
-        default_factory=lambda: pd.DataFrame({"SECRET_PRICE_COLUMN": [123.45]})
-    )
-    complete_report: str = "FULL_REPORT_MUST_NOT_APPEAR"
-
-
-def event(
-    step: int,
-    *,
-    replayable: bool = True,
-    tool_name: str | None = None,
-) -> Event:
-    selected_tool = tool_name or ("run_backtest" if replayable else "get_market_data")
-    observation = ToolObservation(
+def event(step: int, *, success: bool = True, tool_name: str | None = None) -> ToolCallRecord:
+    selected_tool = tool_name or ("run_backtest" if success else "get_market_data")
+    return ToolCallRecord(
+        step=step,
         tool_name=selected_tool,
-        status="success" if replayable else "rejected",
-        summary=f"observation-{step}",
-        identifiers={"segment": "training"} if replayable else {},
-        metrics={"total_return": step / 100} if replayable else {},
-    )
-    return Event(
-        tool_name=selected_tool,
-        normalized_arguments={"stage": "training", "sequence": step},
-        observation=observation,
-        tool_call_id=f"call-{step}" if replayable else None,
-        replayable=replayable,
+        arguments={"stage": "training", "sequence": step},
+        observation=ToolObservation(
+            tool_name=selected_tool,
+            status="success" if success else "rejected",
+            summary=f"observation-{step}",
+            identifiers={"segment": "training"} if success else {},
+            metrics={"total_return": step / 100} if success else {},
+        ),
     )
 
 
@@ -137,56 +119,43 @@ def json_content(message: HumanMessage) -> dict[str, object]:
     return parsed
 
 
-def test_system_prompt_sets_agent_rules_without_a_fixed_workflow() -> None:
-    lower = SYSTEM_PROMPT.lower()
-    critic_lower = CRITIC_SYSTEM_PROMPT.lower()
-
-    assert "tool" in lower
-    assert "one" in lower
-    assert "financial metrics" in lower
-    assert "submit_research_draft" in SYSTEM_PROMPT
-    assert "run_backtest validates" in lower
-    assert "budgets are ceilings, not targets" in lower
-    assert "untested allowed strategy family" in lower
-    assert "not its entire strategy family" in lower
-    assert "never repeat an exact listed candidate" in lower
-    assert "only one candidate" in lower
-    assert "must try materially different parameters" in lower
-    assert "very low" in lower
-    assert "trade count" in lower
-    assert "fixed grid" in lower
-    assert "equal per-family quota" in lower
-    assert "automatically require a second candidate" in lower
-    assert "never call tools in parallel" in lower
-    assert "completed_context" in lower
-    assert "selected_fingerprint" in SYSTEM_PROMPT
-    assert "tested_candidates" in SYSTEM_PROMPT
-    assert "reserve five tool calls" in lower
-    assert "chain-of-thought" not in lower
-    assert "parameter grid" not in lower
-    assert "first get_market_data" not in lower
-    assert "supported by sufficient evidence" in critic_lower
-    assert "one failed default parameterization" in critic_lower
-    assert "sample-in candidate summaries" in critic_lower
-    assert "reject rather than" in critic_lower
-    assert "failed candidate may still support" in critic_lower
-    assert "do not accept merely because" in critic_lower
-    assert "no materially different" in critic_lower
-    assert "do not require two candidates for every family" in critic_lower
+def system_state(research: ResearchWorkspace) -> dict[str, object]:
+    rules, state = research_system_prompt(research).rsplit("\n\n", 1)
+    assert rules == SYSTEM_PROMPT
+    return json.loads(state)["authoritative_current_state"]
 
 
-def test_messages_have_fixed_outer_order_and_confirmed_goal() -> None:
-    workspace = Workspace()
+@pytest.mark.parametrize(
+    ("actions", "expected"),
+    [
+        (["inspect_retrieved_context", "submit_critic_review"], True),
+        (["submit_critic_review"], False),
+        (["submit_critic_review", "inspect_retrieved_context"], False),
+    ],
+)
+def test_critic_evaluation_requires_evidence_before_verdict(
+    monkeypatch: pytest.MonkeyPatch, actions: list[str], expected: bool
+) -> None:
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "scripts"))
+    from run_agent_evals import _policy_evaluator
 
-    messages = build_research_messages(workspace)
+    scores = _policy_evaluator(
+        {},
+        {"actions": [{"tool_name": name} for name in actions], "verdict": "reject"},
+        {"allowed_verdicts": ["reject"]},
+    )
 
-    assert len(messages) == 2
-    assert isinstance(messages[0], SystemMessage)
-    assert convert_to_openai_messages([messages[0]])[0]["role"] == "developer"
-    assert isinstance(messages[1], HumanMessage)
-    context = json_content(messages[1])
+    assert next(score["score"] for score in scores if score["key"] == "evidence_review") is expected
+
+
+def test_a_research_run_opens_with_the_confirmed_goal() -> None:
+    messages = research_input_messages(workspace())
+
+    assert len(messages) == 1
+    assert isinstance(messages[0], HumanMessage)
+    context = json_content(messages[0])
+    assert set(context) == {"confirmed_research_goal"}
     goal_payload = context["confirmed_research_goal"]
-    state_payload = context["authoritative_current_state"]
     assert goal_payload["message_type"] == "confirmed_research_goal"
     assert goal_payload["symbol"] == "AAPL"
     assert goal_payload["benchmark_symbol"] == "SPY"
@@ -194,175 +163,139 @@ def test_messages_have_fixed_outer_order_and_confirmed_goal() -> None:
         "transaction_cost_bps": 5.0,
         "slippage_bps": 5.0,
     }
-    assert state_payload["message_type"] == "authoritative_current_state"
+    assert system_state(workspace())["message_type"] == "authoritative_current_state"
 
 
-def test_only_last_five_actions_are_kept_as_structured_context() -> None:
-    workspace = Workspace(
-        events=[event(1, tool_name="get_market_data"), *[event(index) for index in range(2, 8)]]
+def test_system_state_leaves_observations_to_the_conversation() -> None:
+    journal = [event(1, tool_name="get_market_data"), *[event(i) for i in range(2, 8)]]
+
+    prompt = research_system_prompt(workspace(journal=journal))
+
+    assert "observation-" not in prompt
+    assert {"recent_actions", "completed_context"}.isdisjoint(system_state(workspace()))
+
+
+def test_revision_run_opens_with_the_review_draft_and_every_source_result() -> None:
+    sources = ("sec", "yahoo_finance", "stocktwits", "reddit")
+    evidence = []
+    for index, source in enumerate(sources):
+        if source != "reddit":
+            evidence.append(
+                MarketContextEvidence(
+                    id=f"evidence-{index}",
+                    source_type=(
+                        "official"
+                        if source == "sec"
+                        else "news"
+                        if source == "yahoo_finance"
+                        else "community"
+                    ),
+                    source=source,
+                    title=f"{source} title",
+                    excerpt=f"{source} excerpt",
+                    published_at="2024-01-15",
+                    url=f"https://example.com/{source}",
+                )
+            )
+    search = ToolCallRecord(
+        step=1,
+        tool_name="search_market_context",
+        arguments={"queries": dict.fromkeys(sources, "Apple"), "revision_reason": None},
+        observation=ToolObservation(
+            tool_name="search_market_context",
+            status="success",
+            summary="Searched all configured sources.",
+            metrics={source: 0 if source == "reddit" else 1 for source in sources},
+            warnings=("reddit returned no evidence.",),
+            evidence=tuple(evidence),
+        ),
     )
 
-    messages = build_research_messages(workspace)
-    assert len(messages) == 2
-    assert "observation-2" not in "".join(str(message.content) for message in messages)
-    assert "observation-3" in "".join(str(message.content) for message in messages)
-    state = json_content(messages[-1])["authoritative_current_state"]
-    assert state["completed_context"][0]["tool_name"] == "get_market_data"
-    assert state["completed_context"][0]["summary"] == "observation-1"
-    assert [item["arguments"]["sequence"] for item in state["recent_actions"]] == [
-        3,
-        4,
-        5,
-        6,
-        7,
-    ]
-    assert all(item["tool_name"] == "run_backtest" for item in state["recent_actions"])
-
-
-def test_non_replayable_actions_share_the_structured_action_context() -> None:
-    workspace = Workspace(
-        events=[event(1), event(2), event(3, replayable=False), event(4), event(5), event(6)]
+    draft = ResearchDraft(
+        outcome="selected",
+        selected_fingerprint=LOCKED_FINGERPRINT,
+        conclusion="Select the frozen candidate.",
+        market_context_summary="All sources were assessed.",
+        cited_evidence_ids=("evidence-0",),
+    )
+    review = CriticReview(
+        verdict="revise",
+        summary="The context summary omits a failed source.",
+        required_revision="Disclose the reddit gap.",
+    )
+    revising = workspace(
+        phase="locked",
+        journal=[search],
+        critic_rounds=[CriticRound(draft=draft, review=review)],
     )
 
-    messages = build_research_messages(workspace)
-    state = json_content(messages[-1])["authoritative_current_state"]
+    opening = json_content(research_input_messages(revising)[0])
 
-    correction = state["recent_actions"][1]
-    assert correction["tool_name"] == "get_market_data"
-    assert correction["observation"]["summary"] == "observation-3"
+    assert opening["critic_revision"]["required_revision"] == "Disclose the reddit gap."
+    assert opening["submitted_draft"]["cited_evidence_ids"] == ["evidence-0"]
+    (context,) = opening["retrieved_context"]
+    assert context["queries"] == dict.fromkeys(sources, "Apple")
+    assert context["source_counts"] == {
+        source: 0 if source == "reddit" else 1 for source in sources
+    }
+    assert len(context["evidence"]) == 3
+    assert context["warnings"] == ["reddit returned no evidence."]
 
 
-def test_researching_context_has_training_only_and_excludes_large_objects() -> None:
-    config = MovingAverageConfig(short_window=20, long_window=100)
-    workspace = Workspace(
-        current_candidate=config,
-        training_evaluations={
-            LOCKED_FINGERPRINT: training_evaluation(
-                config,
-                total_return=0.12,
-                max_drawdown=-0.10,
-            )
-        },
-        # A defensive sentinel: final data must not leak while phase is researching.
-        final_evaluations={
-            LOCKED_FINGERPRINT: final_evaluation(
-                config,
-                training_return=0.12,
-                test_return=9876.54321,
-            )
-        },
+def test_researching_context_has_training_metrics_and_budget_only() -> None:
+    researching = workspace(
+        candidates=[candidate(LOCKED_FINGERPRINT, MOVING_AVERAGE, total_return=0.12)],
         agent_steps=4,
         tool_calls=3,
-        training_backtests=1,
-        unresolved_issues=["Need a candidate within the drawdown limit."],
+        fatal_reason="Market data was invalid or insufficient.",
     )
 
-    messages = build_research_messages(workspace)
-    state = json_content(messages[-1])["authoritative_current_state"]
-    serialized = "\n".join(str(message.content) for message in messages)
+    state = system_state(researching)
 
     assert state["phase"] == "researching"
-    assert state["current_candidate"] == {
-        "strategy_name": "moving_average",
-        "parameters": {"short_window": 20, "long_window": 100},
-    }
     assert state["tested_candidates"][0]["training_metrics"]["total_return"] == 0.12
+    assert state["tested_candidates"][0]["training_mean_exposure"] == 0.2
+    assert state["locked_candidate"] is None
     assert "test_metrics" not in json.dumps(state)
-    assert "9876.54321" not in serialized
-    assert "SECRET_PRICE_COLUMN" not in serialized
-    assert "FULL_REPORT_MUST_NOT_APPEAR" not in serialized
+    assert state["unresolved_issues"] == ["Market data was invalid or insufficient."]
     assert state["budget"]["tool_calls"] == {"used": 3, "remaining": 27}
+    assert state["budget"]["training_backtests"]["used"] == 1
 
 
 def test_locked_context_pins_only_the_selected_test_metrics() -> None:
-    selected = MovingAverageConfig(short_window=20, long_window=100)
-    other = RsiConfig(rsi_window=14, entry_threshold=30, exit_threshold=70)
-    workspace = Workspace(
+    locked = workspace(
         phase="locked",
-        current_candidate=selected,
-        training_evaluations={
-            LOCKED_FINGERPRINT: training_evaluation(
-                selected,
-                total_return=0.12,
-                max_drawdown=-0.10,
+        candidates=[
+            candidate(LOCKED_FINGERPRINT, MOVING_AVERAGE, total_return=0.12, test_return=0.06),
+            candidate(
+                OTHER_FINGERPRINT, RSI, total_return=0.20, max_drawdown=-0.25, test_return=9876.5
             ),
-            OTHER_FINGERPRINT: training_evaluation(
-                other,
-                total_return=0.20,
-                max_drawdown=-0.25,
-            ),
-        },
-        final_evaluations={
-            LOCKED_FINGERPRINT: final_evaluation(
-                selected,
-                training_return=0.12,
-                test_return=0.06,
-            ),
-            OTHER_FINGERPRINT: final_evaluation(
-                other,
-                training_return=0.20,
-                test_return=9876.54321,
-            ),
-        },
+        ],
         locked_fingerprint=LOCKED_FINGERPRINT,
-        final_batch_completed=True,
-        events=[event(index) for index in range(1, 7)],
+        journal=[event(index) for index in range(1, 7)],
     )
 
-    messages = build_research_messages(workspace)
-    state = json_content(messages[-1])["authoritative_current_state"]
-    locked = state["locked_candidate"]
+    state = system_state(locked)
+    pinned = state["locked_candidate"]
     serialized = json.dumps(state)
 
-    assert locked["fingerprint"] == LOCKED_FINGERPRINT
-    assert locked["training_metrics"]["total_return"] == 0.12
-    assert locked["test_metrics"]["total_return"] == 0.06
-    assert "9876.54321" not in serialized
+    assert state["final_batch_completed"] is True
+    assert pinned["fingerprint"] == LOCKED_FINGERPRINT
+    assert pinned["training_metrics"]["total_return"] == 0.12
+    assert pinned["test_metrics"]["total_return"] == 0.06
+    assert pinned["test_mean_exposure"] == 0.15
+    assert "9876.5" not in serialized
     assert serialized.count('"test_metrics"') == 1
-    assert "observation-1" not in "\n".join(str(message.content) for message in messages)
-
-
-def test_locked_no_selection_exposes_no_candidate_test_metrics() -> None:
-    config = MovingAverageConfig(short_window=20, long_window=100)
-    workspace = Workspace(
-        phase="locked",
-        training_evaluations={
-            LOCKED_FINGERPRINT: training_evaluation(
-                config,
-                total_return=0.12,
-                max_drawdown=-0.10,
-            )
-        },
-        final_evaluations={
-            LOCKED_FINGERPRINT: final_evaluation(
-                config,
-                training_return=0.12,
-                test_return=9876.54321,
-            )
-        },
-        locked_fingerprint=None,
-        final_batch_completed=True,
-    )
-
-    state = json_content(build_research_messages(workspace)[-1])["authoritative_current_state"]
-
-    assert state["locked_candidate"] == {"fingerprint": None, "selection": "no_strategy"}
-    assert "test_metrics" not in json.dumps(state)
-    assert "9876.54321" not in json.dumps(state)
 
 
 def test_tested_candidates_are_capped_at_eight() -> None:
-    config = MovingAverageConfig(short_window=20, long_window=100)
-    evaluations = {
-        f"{index:064x}": training_evaluation(
-            config,
-            total_return=index / 100,
-            max_drawdown=-0.10,
-        )
-        for index in range(9)
-    }
-    workspace = Workspace(training_evaluations=evaluations)
+    many = workspace(
+        candidates=[
+            candidate(f"{index:064x}", MOVING_AVERAGE, total_return=index / 100)
+            for index in range(9)
+        ]
+    )
 
-    state = json_content(build_research_messages(workspace)[-1])["authoritative_current_state"]
+    state = system_state(many)
 
     assert len(state["tested_candidates"]) == 8

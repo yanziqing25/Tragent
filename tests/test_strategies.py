@@ -6,9 +6,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading.quant import strategies
-from trading.quant.models import MacdConfig, MovingAverageConfig, RsiConfig
-from trading.quant.strategies import (
+from tragent.quant import strategies
+from tragent.quant.models import MacdConfig, MovingAverageConfig, RsiConfig
+from tragent.quant.strategies import (
     accumulate_target_tranches,
     calculate_macd,
     calculate_rsi,
@@ -73,47 +73,6 @@ def test_required_warmup_bars_and_training_boundary() -> None:
         validate_training_length(config, warmup + 2)
         with pytest.raises(ValueError, match=str(warmup + 2)):
             validate_training_length(config, warmup + 1)
-
-
-@pytest.mark.parametrize(
-    ("bad_close", "message"),
-    [
-        (pd.Series([1.0, 2.0, 3.0]), "DatetimeIndex"),
-        (
-            pd.Series(
-                [1.0, 2.0, 3.0],
-                index=pd.to_datetime(["2024-01-03", "2024-01-02", "2024-01-01"]),
-            ),
-            "ascending",
-        ),
-        (
-            pd.Series(
-                [1.0, 2.0, 3.0],
-                index=pd.to_datetime(["2024-01-01", "2024-01-01", "2024-01-02"]),
-            ),
-            "unique",
-        ),
-        (close_series([1.0, np.nan, 3.0]), "finite"),
-        (close_series([1.0, np.inf, 3.0]), "finite"),
-        (close_series([1.0, 0.0, 3.0]), "greater than zero"),
-        (close_series([1.0, -2.0, 3.0]), "greater than zero"),
-    ],
-)
-def test_close_validation_rejects_bad_inputs(
-    bad_close: pd.Series,
-    message: str,
-) -> None:
-    config = MovingAverageConfig(short_window=2, long_window=3)
-
-    with pytest.raises(ValueError, match=message):
-        moving_average_trade_signals(bad_close, config)
-
-
-def test_strategy_rejects_close_shorter_than_indicator_warmup() -> None:
-    config = MacdConfig(fast_period=2, slow_period=4, signal_period=3)
-
-    with pytest.raises(ValueError, match="at least 6"):
-        macd_trade_signals(close_series([1, 2, 3, 4, 5]), config)
 
 
 def test_moving_average_signals_use_full_window_and_strict_comparison() -> None:

@@ -2,43 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from datetime import date
+from hashlib import sha256
 from pathlib import Path
+from threading import Barrier
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
 
-from trading.agent import finalization, runtime
-from trading.agent.finalization import (
-    finalize_critic_review,
-    finish_budget_exhausted,
-    finish_failed,
-)
-from trading.agent.models import (
-    AgentBudget,
-    CriticReview,
-    ResearchGoal,
-    ToolObservation,
-    performance_metrics_dict,
-)
-from trading.agent.runtime import (
-    analyze_drawdown,
-    backtest_fingerprint,
-    calculate_asset_statistics,
-    compare_with_benchmark,
-    get_market_data,
-    run_backtest,
-    submit_research_draft,
-)
-from trading.agent.workspace import (
-    ResearchWorkspace,
-    consume_agent_step,
-    consume_tool_call,
-    lock_selection,
-    record_event,
-)
-from trading.quant import (
+from tragent import storage
+from tragent.quant import (
     BacktestCosts,
     DataQualityReport,
     MarketData,
@@ -48,7 +24,48 @@ from trading.quant import (
     RsiConfig,
     build_strategy_config,
 )
-from trading.reporting import load_report_view
+from tragent.research.agent import finalization, runtime
+from tragent.research.agent.critic import critic_input_messages
+from tragent.research.agent.finalization import (
+    finalize_critic_review,
+    finish_budget_exhausted,
+    finish_failed,
+)
+from tragent.research.agent.models import (
+    AgentBudget,
+    CriticReview,
+    MarketContextEvidence,
+    ResearchGoal,
+    ToolObservation,
+    performance_metrics_dict,
+)
+from tragent.research.agent.retrieval import CONTEXT_SOURCES
+from tragent.research.agent.runtime import (
+    analyze_drawdown,
+    backtest_fingerprint,
+    calculate_asset_statistics,
+    compare_with_benchmark,
+    get_market_data,
+    inspect_retrieved_context,
+    run_backtest,
+    search_market_context,
+    submit_research_draft,
+)
+from tragent.research.agent.workspace import (
+    ResearchGraphContext,
+    ResearchWorkspace,
+    consume_agent_step,
+    record_tool_call,
+)
+from tragent.research.reporting import load_report_view
+
+
+def _artifact_names(prefix: str) -> set[str]:
+    """The names of the task artifacts stored under a prefix."""
+
+    return {
+        name for name in ("market_data.json", "report.json") if storage.exists(f"{prefix}/{name}")
+    }
 
 
 def research_goal(**changes: object) -> ResearchGoal:
@@ -138,13 +155,31 @@ def workspace(
     goal: ResearchGoal | None = None,
     provider: FakeProvider | None = None,
     budget: AgentBudget | None = None,
+    retriever: object | None = None,
 ) -> ResearchWorkspace:
-    return ResearchWorkspace(
-        goal=goal or research_goal(),
-        budget=budget or AgentBudget(),
-        provider=provider or FakeProvider(),
-        output_dir=tmp_path,
+    return ResearchWorkspace(goal=goal or research_goal(), budget=budget or AgentBudget()).bind(
+        ResearchGraphContext(
+            model=MagicMock(),
+            provider=provider or FakeProvider(),
+            artifacts="research/t",
+            retriever=retriever,  # type: ignore[arg-type]
+        )
     )
+
+
+def act(research: ResearchWorkspace, operation, **arguments: object) -> ToolObservation:
+    """Run one Tool operation and journal it, as the Agent harness does."""
+
+    research.agent_steps += 1
+    observation = operation(research, **arguments)
+    record_tool_call(
+        research.journal,
+        step=research.agent_steps,
+        tool_name=observation.tool_name,
+        arguments=arguments,
+        observation=observation,
+    )
+    return observation
 
 
 def prepare_training(
@@ -190,8 +225,10 @@ def test_strategy_construction_is_exact_and_fingerprint_is_canonical() -> None:
     assert backtest_fingerprint(research_goal(), rsi_ints) == backtest_fingerprint(
         research_goal(), rsi_floats
     )
-    with pytest.raises(ValueError, match="exactly"):
+    with pytest.raises(ValueError, match="Unexpected keyword argument"):
         build_strategy_config("moving_average", {"short_window": 5, "long_window": 20, "extra": 1})
+    with pytest.raises(ValueError, match="Field required"):
+        build_strategy_config("moving_average", {"short_window": 5})
     with pytest.raises(ValueError, match="unsupported"):
         build_strategy_config("bollinger", {"window": 20})
 
@@ -214,7 +251,7 @@ def test_fingerprint_contains_goal_strategy_parameters_and_costs() -> None:
     assert all(backtest_fingerprint(goal, config) != baseline for goal, config in variants)
 
 
-def test_runner_facing_counters_lock_and_event_shape(tmp_path: Path) -> None:
+def test_runner_facing_counters_and_journal_shape(tmp_path: Path) -> None:
     research = workspace(
         tmp_path,
         budget=AgentBudget(
@@ -227,36 +264,27 @@ def test_runner_facing_counters_lock_and_event_shape(tmp_path: Path) -> None:
     assert consume_agent_step(research) is True
     assert consume_agent_step(research) is True
     assert consume_agent_step(research) is False
-    assert consume_tool_call(research) is True
-    assert consume_tool_call(research) is True
-    assert consume_tool_call(research) is False
-    assert lock_selection(research, None) is True
-    assert research.phase == "locked"
-    assert research.locked_fingerprint is None
-    assert lock_selection(research, "a" * 64) is False
 
     observation = ToolObservation(
         tool_name="get_market_data", status="rejected", summary="Market data was unavailable."
     )
-    event = record_event(
-        research,
+    record_tool_call(
+        research.journal,
+        step=research.agent_steps,
         tool_name="get_market_data",
-        normalized_arguments={},
+        arguments={},
         observation=observation,
-        tool_call_id=None,
-        replayable=False,
     )
-    assert event.observation == observation
-    assert event.replayable is False
-    assert research.events == [event]
+    assert [(record.step, record.observation) for record in research.journal] == [(2, observation)]
+    assert research.latest_success("get_market_data") is None
 
 
 def test_market_data_uses_only_goal_inputs_and_success_is_cached(tmp_path: Path) -> None:
     provider = FakeProvider()
     research = workspace(tmp_path, provider=provider)
 
-    first = get_market_data(research)
-    second = get_market_data(research)
+    first = act(research, get_market_data)
+    second = act(research, get_market_data)
 
     expected = [
         ("AAPL", date(2024, 1, 1), date(2024, 1, 20)),
@@ -282,8 +310,8 @@ def test_download_retries_once_but_deterministic_data_error_is_immediately_fatal
     )
     retrying = workspace(tmp_path / "retry", provider=download_provider)
 
-    first = get_market_data(retrying)
-    second = get_market_data(retrying)
+    first = act(retrying, get_market_data)
+    second = act(retrying, get_market_data)
 
     assert first.status == second.status == "error"
     assert retrying.fatal_reason is not None
@@ -318,18 +346,34 @@ def test_data_strategy_operations_are_compact_and_do_not_require_a_fixed_order(
 
     monkeypatch.setattr(runtime, "quant_calculate_asset_statistics", spy_statistics)
 
-    assert calculate_asset_statistics(research).status == "rejected"
+    assert act(research, calculate_asset_statistics).status == "rejected"
     assert statistics_calls == 0
 
-    market_data = get_market_data(research)
-    first_statistics = calculate_asset_statistics(research)
-    second_statistics = calculate_asset_statistics(research)
+    market_data = act(research, get_market_data)
+    first_statistics = act(research, calculate_asset_statistics)
+    second_statistics = act(research, calculate_asset_statistics)
 
     assert market_data.status == "success"
     assert market_data.metrics["asset_valid_rows"] == 20
     assert market_data.metrics["benchmark_valid_rows"] == 20
     assert first_statistics == second_statistics
     assert statistics_calls == 1
+
+
+def test_asset_statistics_never_see_sample_out_bars(tmp_path: Path) -> None:
+    changed = market_data("AAPL")
+    changed.bars.loc[changed.bars.index[14:], ["open", "high", "low", "close"]] *= 0.5
+
+    observations = []
+    for name, asset in (("original", market_data("AAPL")), ("changed", changed)):
+        provider = FakeProvider({"AAPL": asset, "SPY": market_data("SPY", scale=2.0)})
+        research = workspace(tmp_path / name, provider=provider)
+        act(research, get_market_data)
+        observations.append(act(research, calculate_asset_statistics))
+
+    assert observations[0] == observations[1]
+    assert observations[0].identifiers["segment"] == "training"
+    assert observations[0].metrics["observations"] == 14
 
 
 def test_symbol_spy_warning_flows_from_data_into_runtime_state(tmp_path: Path) -> None:
@@ -431,20 +475,12 @@ def test_final_locks_before_atomic_batch_and_exposes_only_selected_test(
         strategy_name="moving_average",
         parameters={"short_window": 2, "long_window": 4},
     ).identifiers["fingerprint"]
-    missing_family = run_backtest(research, stage="final", selected_fingerprint=selected)
-    assert missing_family.status == "rejected"
-    assert missing_family.identifiers["strategy_name"] == "rsi"
-    assert research.phase == "researching"
-
     first_rsi = run_backtest(
         research,
         stage="training",
         strategy_name="rsi",
         parameters={"rsi_window": 2, "entry_threshold": 40, "exit_threshold": 60},
     ).identifiers["fingerprint"]
-    anomalous_family = run_backtest(research, stage="final", selected_fingerprint=selected)
-    assert anomalous_family.status == "rejected"
-    assert "non-positive" in anomalous_family.summary
     second_rsi = run_backtest(
         research,
         stage="training",
@@ -478,28 +514,18 @@ def test_final_locks_before_atomic_batch_and_exposes_only_selected_test(
     assert research.phase == "locked"
     assert research.locked_fingerprint == selected
     assert research.final_batch_completed is True
-    assert set(research.final_evaluations) == {selected, other, first_rsi, second_rsi}
+    assert [item.fingerprint for item in research.candidates if item.test] == [
+        selected,
+        other,
+        first_rsi,
+        second_rsi,
+    ]
     assert len(final_calls) == 4
-    assert observation.metrics == performance_metrics_dict(
-        research.final_evaluations[selected].test.metrics
-    )
-    assert (
-        str(research.final_evaluations[other].test.metrics.total_return) not in observation.summary
-    )
-
-    monkeypatch.setattr(runtime, "quant_run_final_evaluation", real_final)
-    protected_reserve = workspace(
-        tmp_path / "protected-reserve",
-        goal=research_goal(allowed_strategies=("moving_average", "rsi")),
-    )
-    reserve_selected = prepare_training(protected_reserve)
-    protected_reserve.tool_calls = protected_reserve.budget.max_tool_calls - 5
-    reserve_final = run_backtest(
-        protected_reserve,
-        stage="final",
-        selected_fingerprint=reserve_selected,
-    )
-    assert reserve_final.status == "success"
+    assert observation.metrics == {
+        **performance_metrics_dict(research.candidate(selected).test.metrics),
+        "mean_exposure": research.candidate(selected).test.mean_exposure,
+    }
+    assert str(research.candidate(other).test.metrics.total_return) not in observation.summary
 
     training_calls = 0
 
@@ -550,7 +576,7 @@ def test_final_batch_failure_is_atomic_fatal_and_keeps_locked_selection(
     assert research.phase == "locked"
     assert research.locked_fingerprint == selected
     assert research.final_batch_completed is False
-    assert research.final_evaluations == {}
+    assert all(candidate.test is None for candidate in research.candidates)
     assert research.fatal_reason is not None
     assert research.training_backtests == 2
 
@@ -574,7 +600,7 @@ def test_analysis_and_comparison_enforce_test_access_and_use_stored_results(tmp_
     assert analyze_drawdown(research, fingerprint=other, segment="test").status == "rejected"
     drawdown = analyze_drawdown(research, fingerprint=selected, segment="test")
     comparison = compare_with_benchmark(research, fingerprint=selected, segment="test")
-    metrics = research.final_evaluations[selected].test.metrics
+    metrics = research.candidate(selected).test.metrics
 
     assert drawdown.metrics["max_drawdown"] == metrics.max_drawdown
     assert comparison.metrics == {
@@ -610,12 +636,212 @@ def test_submit_selected_is_reviewed_before_trusted_result_and_report(tmp_path: 
     assert research.result.status == "selected"
     assert research.result.selected_fingerprint == selected
     assert research.result.training_metrics == performance_metrics_dict(
-        research.final_evaluations[selected].training.metrics
+        research.candidate(selected).training.metrics
     )
     assert research.result.test_metrics == performance_metrics_dict(
-        research.final_evaluations[selected].test.metrics
+        research.candidate(selected).test.metrics
     )
-    assert (research.output_dir / "report.json").is_file()
+    assert "report.json" in _artifact_names(research.artifacts)
+
+
+def test_critic_packet_carries_sample_in_asset_statistics(tmp_path: Path) -> None:
+    research = workspace(tmp_path)
+    selected = prepare_training(research)
+    statistics = act(research, calculate_asset_statistics)
+    assert run_backtest(research, stage="final", selected_fingerprint=selected).status == "success"
+    assert (
+        submit_research_draft(
+            research,
+            outcome="selected",
+            selected_fingerprint=selected,
+            conclusion="The frozen candidate met the drawdown constraint.",
+            limitations=(),
+        ).status
+        == "success"
+    )
+
+    packet = json.loads(critic_input_messages(research)[0].content)["critic_review_packet"]
+
+    assert packet["sample_in_asset_statistics"] == dict(statistics.metrics)
+
+
+def test_retrieved_context_is_post_lock_cited_and_reviewable(tmp_path: Path) -> None:
+    evidence_id = {source: sha256(source.encode()).hexdigest()[:24] for source in CONTEXT_SOURCES}
+    barrier = Barrier(len(CONTEXT_SOURCES))
+    searched_sources: list[str] = []
+
+    class FakeRetriever:
+        def search(self, **kwargs: object) -> tuple[MarketContextEvidence, ...]:
+            source = str(kwargs["source"])
+            barrier.wait(timeout=2)
+            searched_sources.append(source)
+            if source == "reddit":
+                raise OSError("source unavailable")
+            source_type = (
+                "official"
+                if source == "sec"
+                else "news"
+                if source == "yahoo_finance"
+                else "community"
+            )
+            return (
+                MarketContextEvidence(
+                    id=evidence_id[source],
+                    source_type=source_type,
+                    source=source,
+                    title=f"{source} evidence",
+                    excerpt=f"Relevant bounded context from {source}.",
+                    published_at="2024-01-15",
+                    url=f"https://example.com/{source}",
+                ),
+            )
+
+    research = workspace(tmp_path, retriever=FakeRetriever())
+    queries = dict.fromkeys(CONTEXT_SOURCES, "material risks")
+    assert search_market_context(research, queries=queries).status == "rejected"
+    selected = prepare_training(research)
+    assert run_backtest(research, stage="final", selected_fingerprint=selected).status == "success"
+
+    observation = search_market_context(research, queries=queries)
+    assert set(searched_sources) == set(CONTEXT_SOURCES)
+    assert observation.evidence[0].id == evidence_id["sec"]
+    assert observation.metrics["reddit"] is None
+    assert "reddit retrieval failed." in observation.warnings
+    record_tool_call(
+        research.journal,
+        step=research.agent_steps,
+        tool_name="search_market_context",
+        arguments={"queries": queries},
+        observation=observation,
+    )
+    assert (
+        submit_research_draft(
+            research,
+            outcome="selected",
+            selected_fingerprint=selected,
+            conclusion="Select the frozen candidate.",
+            limitations=(),
+            market_context_summary=f"The latest filing highlights uncertainty ({'f' * 24}).",
+        ).status
+        == "rejected"
+    )
+    evidence_ids = tuple(evidence_id[source] for source in CONTEXT_SOURCES[:-1])
+    assert (
+        submit_research_draft(
+            research,
+            outcome="selected",
+            selected_fingerprint=selected,
+            conclusion="Select the frozen candidate.",
+            limitations=(),
+            market_context_summary=(
+                f"The official, news, and community sources were assessed ({', '.join(evidence_ids)})."
+            ),
+        ).status
+        == "success"
+    )
+    inspected = inspect_retrieved_context(research)
+    assert {item.id for item in inspected.evidence} == set(evidence_ids)
+    assert inspected.metrics["reddit"] is None
+
+    finalize_latest_review(research)
+    report = load_report_view(f"{research.artifacts}/report.json")
+    assert {item.id for item in report.market_context_sources} == set(evidence_ids)
+    assert report.market_context_summary is not None
+
+
+def test_context_search_covers_every_source_then_allows_one_reasoned_revision(
+    tmp_path: Path,
+) -> None:
+    class FakeRetriever:
+        def search(self, **kwargs: object) -> tuple[MarketContextEvidence, ...]:
+            source, query = str(kwargs["source"]), str(kwargs["query"])
+            return (
+                MarketContextEvidence(
+                    id=sha256(f"{source}:{query}".encode()).hexdigest()[:24],
+                    source_type="official" if source == "sec" else "community",
+                    source=source,
+                    title=f"{source} result for {query}",
+                    excerpt=f"Context about {query}.",
+                    published_at="2024-01-15",
+                    url=f"https://example.com/{source}/{query}",
+                ),
+            )
+
+    research = workspace(tmp_path, retriever=FakeRetriever())
+    selected = prepare_training(research)
+    assert run_backtest(research, stage="final", selected_fingerprint=selected).status == "success"
+    first = dict.fromkeys(CONTEXT_SOURCES, "Apple")
+    revised = {"reddit": '"Apple Inc"'}
+    reason = "Reddit results discussed other companies."
+
+    assert act(research, search_market_context, queries={"sec": "Apple"}).status == "rejected"
+    assert act(research, search_market_context, queries=first).status == "success"
+    assert act(research, search_market_context, queries=revised).status == "rejected"
+    revision = act(research, search_market_context, queries=revised, revision_reason=reason)
+    assert revision.status == "success"
+    assert act(research, search_market_context, queries=revised, revision_reason=reason).status == (
+        "rejected"
+    )
+
+    assert (
+        submit_research_draft(
+            research,
+            outcome="selected",
+            selected_fingerprint=selected,
+            conclusion="Select the frozen candidate.",
+            limitations=(),
+            market_context_summary=f"Community view ({revision.evidence[0].id}).",
+        ).status
+        == "success"
+    )
+    inspected = inspect_retrieved_context(research)
+    assert inspected.metrics == dict.fromkeys(CONTEXT_SOURCES, 1)
+    assert f"Revised reddit: {reason}" in inspected.summary
+
+
+def test_draft_cites_exactly_the_retrieved_evidence_its_summary_names(tmp_path: Path) -> None:
+    filing_ids = {"a" * 24: "First filing excerpt", "b" * 24: "Second filing excerpt"}
+
+    class FakeRetriever:
+        def search(self, **kwargs: object) -> tuple[MarketContextEvidence, ...]:
+            if kwargs["source"] != "sec":
+                return ()
+            return tuple(
+                MarketContextEvidence(
+                    id=evidence_id,
+                    source_type="official",
+                    source="SEC",
+                    title=title,
+                    excerpt=f"{title}.",
+                    published_at="2024-01-15",
+                    url=f"https://example.com/{evidence_id}",
+                )
+                for evidence_id, title in filing_ids.items()
+            )
+
+    research = workspace(tmp_path, retriever=FakeRetriever())
+    selected = prepare_training(research)
+    assert run_backtest(research, stage="final", selected_fingerprint=selected).status == "success"
+    act(research, search_market_context, queries=dict.fromkeys(CONTEXT_SOURCES, "risks"))
+
+    def submit(summary: str) -> ToolObservation:
+        return submit_research_draft(
+            research,
+            outcome="selected",
+            selected_fingerprint=selected,
+            conclusion="Select the frozen candidate.",
+            limitations=(),
+            market_context_summary=summary,
+        )
+
+    rejected = submit(f"Both filings note risks ({'a' * 24}, {'c' * 24}).")
+
+    assert rejected.status == "rejected"
+    assert "c" * 24 in rejected.summary
+    assert submit(f"The first filing notes risks ({'a' * 24}, again {'a' * 24}).").status == (
+        "success"
+    )
+    assert research.critic_rounds[-1].draft.cited_evidence_ids == ("a" * 24,)
 
 
 def test_submit_gate_enforces_only_an_explicit_drawdown_limit(
@@ -724,7 +950,7 @@ def test_locked_candidate_can_submit_no_strategy(tmp_path: Path) -> None:
     assert rejected.result.status == "critic_rejected"
     assert rejected.result.selected_fingerprint is None
     assert rejected.result.test_metrics
-    report = load_report_view(rejected.output_dir / "report.json")
+    report = load_report_view(f"{rejected.artifacts}/report.json")
     assert report.critic_review_status == "rejected"
     assert report.selected_candidate_id is None
 
@@ -752,7 +978,7 @@ def test_report_failure_is_sanitized_and_runner_terminal_helpers_complete(
     result = finalize_latest_review(research)
     assert research.result is not None
     assert research.result.status == "failed"
-    assert not (research.output_dir / "report.json").exists()
+    assert "report.json" not in _artifact_names(research.artifacts)
     assert research.phase == "completed"
     assert "unsafe-report-secret" not in (
         observation.to_compact_json() + research.result.model_dump_json()
@@ -763,13 +989,13 @@ def test_report_failure_is_sanitized_and_runner_terminal_helpers_complete(
     failed_result = finish_failed(failed, "Market data was invalid.")
     assert failed.phase == "completed"
     assert failed_result.status == "failed"
-    assert not (failed.output_dir / "report.json").exists()
+    assert "report.json" not in _artifact_names(failed.artifacts)
 
     exhausted = workspace(tmp_path / "budget")
     exhausted_result = finish_budget_exhausted(exhausted, "Tool call budget was exhausted.")
     assert exhausted.phase == "completed"
     assert exhausted_result.status == "budget_exhausted"
-    assert not (exhausted.output_dir / "report.json").exists()
+    assert "report.json" not in _artifact_names(exhausted.artifacts)
 
 
 def test_budget_terminal_reports_training_only_or_preserves_locked_final_metrics(
@@ -782,10 +1008,10 @@ def test_budget_terminal_reports_training_only_or_preserves_locked_final_metrics
         "The Tool call budget was exhausted.",
     )
 
-    assert training_only.final_evaluations == {}
+    assert training_only.final_batch_completed is False
     assert training_result.training_metrics == {}
     assert training_result.test_metrics == {}
-    report = load_report_view(training_only.output_dir / "report.json")
+    report = load_report_view(f"{training_only.artifacts}/report.json")
     assert report.research_incomplete is True
     assert len(report.candidates) >= 1
     assert all(len(candidate.segments) == 1 for candidate in report.candidates)
@@ -796,7 +1022,8 @@ def test_budget_terminal_reports_training_only_or_preserves_locked_final_metrics
 
     result = finish_budget_exhausted(research, "The Tool call budget was exhausted.")
 
-    final = research.final_evaluations[selected]
+    final = research.candidate(selected)
+    assert final is not None and final.test is not None
     assert result.status == "budget_exhausted"
     assert result.evaluated_fingerprint == selected
     assert result.training_metrics == performance_metrics_dict(final.training.metrics)

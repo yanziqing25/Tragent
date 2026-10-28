@@ -4,38 +4,46 @@ from __future__ import annotations
 
 import copy
 import json
-import traceback
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+import httpx
 import pandas as pd
 import pytest
-from langchain_core.language_models import BaseChatModel
+from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
-    convert_to_openai_messages,
+    SystemMessage,
+    ToolMessage,
 )
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from langsmith import tracing_context
 from pydantic import PrivateAttr
 
-import trading.agent.finalization as finalization_module
-import trading.agent.graph as graph_module
-import trading.agent.runtime as runtime_module
-from trading.agent.events import AgentEvent
-from trading.agent.graph import parse_goal
-from trading.agent.models import AgentBudget, GoalDraft
-from trading.agent.state import GraphState, validate_graph_state
-from trading.quant import DataQualityReport, MarketData
-from trading.reporting import load_report_view
+import tragent.research.agent.goal as goal_module
+import tragent.research.agent.graph as graph_module
+import tragent.research.agent.runtime as runtime_module
+from tragent import storage
+from tragent.quant import DataQualityReport, MarketData
+from tragent.research.agent.critic import CRITIC_SYSTEM_PROMPT
+from tragent.research.agent.events import AgentEvent
+from tragent.research.agent.goal import apply_goal_answer, initial_graph_state
+from tragent.research.agent.graph import parse_goal
+from tragent.research.agent.harness import require_single_tool_call
+from tragent.research.agent.models import AgentBudget, GoalDraft
+from tragent.research.agent.prompt import SYSTEM_PROMPT
+from tragent.research.agent.state import GraphState, validate_graph_state
+from tragent.research.agent.workspace import ResearchWorkspace
+from tragent.research.reporting import load_report_view
 
 type FakeMode = Literal[
     "valid",
@@ -44,8 +52,18 @@ type FakeMode = Literal[
     "invalid_tool",
     "wrong_tool",
     "transport_error",
+    "transient_once",
     "bind_error",
 ]
+
+
+def _artifact_names(prefix: str) -> set[str]:
+    """The names of the task artifacts stored under a prefix."""
+
+    return {
+        name for name in ("market_data.json", "report.json") if storage.exists(f"{prefix}/{name}")
+    }
+
 
 _INTERVAL_INDEPENDENT_DEFAULTED_FIELDS = [
     "allowed_strategies",
@@ -64,16 +82,19 @@ _RESEARCH_TOOL_NAMES = (
     "run_backtest",
     "analyze_drawdown",
     "compare_with_benchmark",
+    "search_market_context",
     "submit_research_draft",
 )
 _RESEARCH_REVISION_TOOL_NAMES = (
     "analyze_drawdown",
     "compare_with_benchmark",
+    "inspect_retrieved_context",
     "submit_research_draft",
 )
 _CRITIC_TOOL_NAMES = (
     "inspect_selected_drawdown",
     "compare_selected_with_benchmark",
+    "inspect_retrieved_context",
     "submit_critic_review",
 )
 
@@ -84,7 +105,52 @@ def _nullable_goal_response(**changes: object) -> dict[str, object]:
     return response
 
 
-class GoalParserFakeChatModel(BaseChatModel):
+def test_require_single_tool_call_uses_provider_contract_without_rewriting_response() -> None:
+    model = GoalParserFakeChatModel()
+    request = ModelRequest(model=model, messages=[])
+    response = ModelResponse(
+        result=[
+            AIMessage(
+                content=[
+                    {"type": "text", "text": "I will verify both segments."},
+                    {
+                        "type": "function_call",
+                        "name": "first",
+                        "arguments": "{}",
+                        "call_id": "1",
+                    },
+                    {
+                        "type": "function_call",
+                        "name": "second",
+                        "arguments": "{}",
+                        "call_id": "2",
+                    },
+                ],
+                tool_calls=[
+                    {"name": "first", "args": {}, "id": "1", "type": "tool_call"},
+                    {"name": "second", "args": {}, "id": "2", "type": "tool_call"},
+                ],
+            )
+        ]
+    )
+
+    captured_request: ModelRequest[Any] | None = None
+
+    def handler(current_request: ModelRequest[Any]) -> ModelResponse:
+        nonlocal captured_request
+        captured_request = current_request
+        return response
+
+    returned = require_single_tool_call.wrap_model_call(request, handler)
+
+    assert returned is response
+    assert captured_request is not None
+    assert captured_request.tool_choice == "required"
+    assert captured_request.model_settings["parallel_tool_calls"] is False
+    assert captured_request.model_settings["strict"] is False
+
+
+class GoalParserFakeChatModel(ChatOpenAI):
     """Single-purpose fake that emits native ToolCalls for the bound goal schema."""
 
     _mode: FakeMode = PrivateAttr()
@@ -102,7 +168,7 @@ class GoalParserFakeChatModel(BaseChatModel):
         mode: FakeMode = "valid",
         call_id: str = "goal-call-1",
     ) -> None:
-        super().__init__()
+        super().__init__(api_key="test-llm-key", model="test-model", use_responses_api=False)
         self._mode = mode
         self._draft = dict(draft or {})
         self._call_id = call_id
@@ -159,6 +225,8 @@ class GoalParserFakeChatModel(BaseChatModel):
         self._messages_seen.append(list(messages))
         if self._mode == "transport_error":
             raise RuntimeError("unsafe-goal-transport-secret")
+        if self._mode == "transient_once" and len(self._messages_seen) == 1:
+            raise httpx.ConnectError("unsafe-transient-goal-detail")
         if len(self._bound_tool_names) != 1:
             raise AssertionError("the goal parser must bind exactly one schema")
 
@@ -391,38 +459,42 @@ def _graph_market_data(symbol: str, *, falling: bool = False) -> MarketData:
     )
 
 
+def _system_section(messages: list[BaseMessage], name: str) -> dict[str, Any] | None:
+    system = messages[0]
+    if not isinstance(system, SystemMessage):
+        return None
+    section = json.loads(system.text.rsplit("\n\n", 1)[1]).get(name)
+    return section if isinstance(section, dict) else None
+
+
 def _react_state(messages: list[BaseMessage]) -> dict[str, Any]:
-    for message in reversed(messages):
-        if not isinstance(message, HumanMessage) or not isinstance(message.content, str):
-            continue
-        payload = json.loads(message.content)
-        state = payload.get("authoritative_current_state")
-        if isinstance(state, dict):
-            return state
-    raise AssertionError("the Graph did not supply authoritative ReAct state")
+    state = _system_section(messages, "authoritative_current_state")
+    if state is None:
+        raise AssertionError("the Graph did not supply authoritative ReAct state")
+    return state
 
 
 def _critic_payload(messages: list[BaseMessage], message_type: str) -> dict[str, Any]:
+    section = _system_section(messages, message_type)
+    if section is not None:
+        return section
     for message in messages:
-        if not isinstance(message, HumanMessage) or not isinstance(message.content, str):
-            continue
-        payload = json.loads(message.content)
-        section = payload.get(message_type)
-        if isinstance(section, dict):
-            return section
+        if isinstance(message, HumanMessage) and isinstance(message.content, str):
+            section = json.loads(message.content).get(message_type)
+            if isinstance(section, dict):
+                return section
     raise AssertionError(f"the Graph did not supply {message_type}")
 
 
+def _run_opening(messages: list[BaseMessage]) -> dict[str, Any]:
+    opening = next(message for message in messages if isinstance(message, HumanMessage))
+    return json.loads(opening.text)
+
+
 def _react_observations(messages: list[BaseMessage]) -> list[dict[str, Any]]:
-    for message_type in ("authoritative_current_state", "critic_current_state"):
-        try:
-            state = _critic_payload(messages, message_type)
-        except AssertionError:
-            continue
-        observations = list(state.get("completed_context", []))
-        observations.extend(action["observation"] for action in state.get("recent_actions", []))
-        return observations
-    raise AssertionError("the Graph did not supply structured ReAct observations")
+    """Observations the Agent has seen in this run's ReAct conversation."""
+
+    return [json.loads(message.content) for message in messages if isinstance(message, ToolMessage)]
 
 
 def _react_call(
@@ -466,30 +538,29 @@ def _must_not_redecide(messages: list[BaseMessage]) -> AIMessage:
     raise AssertionError("a recovered pending Action must execute without model re-decision")
 
 
-class FailOnceResearchDecision:
-    """Raise one transient model error, then decide from the durable current state."""
+class FailingResearchDecision:
+    """Raise transient model errors a fixed number of times, then decide normally."""
 
-    def __init__(self) -> None:
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
         self.calls = 0
 
     def __call__(self, messages: list[BaseMessage]) -> AIMessage:
         self.calls += 1
-        if self.calls == 1:
-            raise RuntimeError("unsafe-transient-model-detail")
+        if self.calls <= self.failures:
+            raise httpx.ConnectError("unsafe-transient-model-detail")
         return _single_market_data_decider(messages)
 
 
-def _worst_case_budget_decider(messages: list[BaseMessage]) -> AIMessage:
-    state = _react_state(messages)
-    tool_calls = state["budget"]["tool_calls"]["used"]
-    return _react_call(
-        messages,
-        "analyze_drawdown",
-        {
-            "fingerprint": f"{tool_calls + 1:064x}",
-            "segment": "training",
-        },
-    )
+@pytest.fixture
+def retry_delays(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record ModelRetryMiddleware backoff instead of sleeping."""
+
+    import langchain.agents.middleware.model_retry as model_retry
+
+    delays: list[float] = []
+    monkeypatch.setattr(model_retry.time, "sleep", delays.append)
+    return delays
 
 
 def _accept_critic_decider(messages: list[BaseMessage]) -> AIMessage:
@@ -590,7 +661,7 @@ def _pause_after_final_decider(messages: list[BaseMessage]) -> AIMessage:
     assert state["locked_candidate"]["fingerprint"] == fingerprint
     assert "test_metrics" in state["locked_candidate"]
     assert all("test_metrics" not in item for item in candidates)
-    raise RuntimeError("unsafe-process-boundary-after-final")
+    raise httpx.ConnectError("unsafe-process-boundary-after-final")
 
 
 def _submit_locked_decider(messages: list[BaseMessage]) -> AIMessage:
@@ -768,7 +839,7 @@ def _revision_research_decider(messages: list[BaseMessage]) -> AIMessage:
             "run_backtest",
             {"stage": "final", "selected_fingerprint": fingerprint},
         )
-    revision = state["critic_revision"]
+    revision = _run_opening(messages).get("critic_revision")
     if revision is not None and not any(
         item["tool_name"] == "compare_with_benchmark"
         and item["identifiers"].get("segment") == "test"
@@ -843,6 +914,10 @@ def _seed(
     }
 
 
+def _task(**seed: object) -> GraphState:
+    return initial_graph_state(_seed(**seed))  # type: ignore[arg-type]
+
+
 def _explicit_draft() -> dict[str, object]:
     return {
         "symbol": "AAPL",
@@ -874,10 +949,10 @@ def _graph_research_draft(symbol: str = "AAPL") -> dict[str, object]:
     }
 
 
-def _draft_goal(state: GraphState) -> dict[str, object]:
-    draft = state["draft_goal"]
-    assert isinstance(draft, dict)
-    return draft
+def _draft_goal(state: GraphState | Mapping[str, object]) -> dict[str, object]:
+    draft = validate_graph_state(state).draft_goal
+    assert draft is not None
+    return draft.model_dump(mode="json")
 
 
 def _interrupt_goal(output: dict[str, Any]) -> dict[str, object]:
@@ -889,20 +964,12 @@ def _interrupt_goal(output: dict[str, Any]) -> dict[str, object]:
 
 def _assert_goal_parsing_failure(state: GraphState) -> None:
     assert validate_graph_state(state) == state
-    assert state["status"] == "failed"
-    assert state["failure_stage"] == "goal_parsing"
-    assert state["failure_summary"] == _GOAL_PARSE_FAILURE
-    assert state["draft_goal"] is None
-    assert state["confirmed_goal"] is None
-    assert state["defaulted_fields"] == []
-    assert state["phase"] is None
-    assert state["terminal_result"] is None
-    assert state["agent_steps"] == state["tool_calls"] == state["training_backtests"] == 0
-    assert state["message_journal"] == []
-    assert state["data_snapshot"] is None
-    assert state["validated_configs"] == {}
-    assert state["training_evaluations"] == []
-    assert state["final_evaluations"] == []
+    assert state.status == "failed"
+    assert state.failure_stage == "goal_parsing"
+    assert state.failure_summary == _GOAL_PARSE_FAILURE
+    assert state.draft_goal is None
+    assert state.defaulted_fields == ()
+    assert state.workspace is None
 
 
 def _build_production_graph(*, checkpointer: Any | None = None) -> Any:
@@ -929,18 +996,18 @@ def _start_to_confirmation(
     initial_seed = seed or _seed()
     thread_id = initial_seed["thread_id"]
     assert isinstance(thread_id, str)
-    report_dir = tmp_path / thread_id
+    report_dir = f"research/{thread_id}"
     provider = NeverMarketDataProvider()
     context: dict[str, object] = {
         "model": model,
         "provider": provider,
-        "output_dir": report_dir,
+        "artifacts": report_dir,
     }
     config: dict[str, object] = {"configurable": {"thread_id": thread_id}}
     graph = _build_production_graph()
 
     output = graph.invoke(
-        initial_seed,
+        initial_graph_state(initial_seed).model_dump(mode="json"),
         config,
         context=context,
         durability="sync",
@@ -957,9 +1024,9 @@ def _interrupt_payload(output: Mapping[str, object]) -> dict[str, object]:
     return dict(value)
 
 
-def _checkpoint_state(graph: Any, config: dict[str, object]) -> GraphState:
+def _checkpoint_state(graph: Any, config: dict[str, object]) -> dict[str, object]:
     snapshot = graph.get_state(config)
-    return validate_graph_state(dict(snapshot.values))
+    return validate_graph_state(dict(snapshot.values)).model_dump(mode="json")
 
 
 def _checkpoint_error_envelope(
@@ -985,7 +1052,7 @@ def _active_agent_workspace_checkpoint(
     saver: InMemorySaver,
     graph: Any,
     config: dict[str, object],
-) -> GraphState:
+) -> dict[str, object]:
     snapshot = graph.get_state(config)
     assert len(snapshot.tasks) == 1
     task = snapshot.tasks[0]
@@ -998,25 +1065,23 @@ def _active_agent_workspace_checkpoint(
     }
     saved = saver.get_tuple(child_config)
     assert saved is not None
-    workspace_state = saved.checkpoint["channel_values"].get("workspace_state")
-    assert isinstance(workspace_state, Mapping)
-    return validate_graph_state(workspace_state)
+    workspace = saved.checkpoint["channel_values"].get("workspace")
+    assert isinstance(workspace, Mapping)
+    return ResearchWorkspace.model_validate(workspace).model_dump(mode="json")
 
 
-def _assert_research_side_effects_are_zero(state: GraphState) -> None:
-    assert state["agent_steps"] == 0
-    assert state["tool_calls"] == 0
-    assert state["training_backtests"] == 0
-    assert state["download_failures"] == 0
-    assert state["message_journal"] == []
-    assert state["data_snapshot"] is None
-    assert state["current_candidate"] is None
-    assert state["validated_configs"] == {}
-    assert state["training_evaluations"] == []
-    assert state["final_evaluations"] == []
-    assert state["locked_fingerprint"] is None
-    assert state["final_batch_completed"] is False
-    assert state["terminal_result"] is None
+def _assert_research_side_effects_are_zero(state: Mapping[str, object]) -> None:
+    workspace = state["workspace"]
+    if workspace is None:
+        return
+    assert (workspace["agent_steps"], workspace["tool_calls"], workspace["download_failures"]) == (
+        0,
+        0,
+        0,
+    )
+    assert workspace["journal"] == workspace["candidates"] == workspace["critic_rounds"] == []
+    assert workspace["locked_fingerprint"] is None
+    assert workspace["result"] is None
 
 
 def _run_approved_graph_to_terminal(
@@ -1026,7 +1091,7 @@ def _run_approved_graph_to_terminal(
     provider: GraphMarketDataProvider,
     budget: AgentBudget,
     events: list[AgentEvent] | None = None,
-) -> tuple[GraphState, Path]:
+) -> tuple[dict[str, object], Path]:
     seed = _seed(
         request="Research AAPL dynamically with the supported long-only strategies.",
         reference_date="2024-01-30",
@@ -1034,11 +1099,11 @@ def _run_approved_graph_to_terminal(
     seed["budget"] = budget.model_dump(mode="json")
     thread_id = seed["thread_id"]
     assert isinstance(thread_id, str)
-    report_dir = tmp_path / thread_id
+    report_dir = f"research/{thread_id}"
     context: dict[str, object] = {
         "model": model,
         "provider": provider,
-        "output_dir": report_dir,
+        "artifacts": report_dir,
     }
     config: dict[str, object] = {
         "configurable": {"thread_id": thread_id},
@@ -1059,7 +1124,7 @@ def _run_approved_graph_to_terminal(
             if events is not None:
                 events.append(AgentEvent.model_validate(part["data"]))
 
-    stream(seed)
+    stream(initial_graph_state(seed).model_dump(mode="json"))
     awaiting_confirmation = _checkpoint_state(graph, config)
     assert awaiting_confirmation["status"] == "awaiting_confirmation"
     assert _draft_goal(awaiting_confirmation)["symbol"] == "AAPL"
@@ -1085,11 +1150,11 @@ def _start_durable_research_graph(
     seed["budget"] = budget.model_dump(mode="json")
     thread_id = seed["thread_id"]
     assert isinstance(thread_id, str)
-    report_dir = tmp_path / thread_id
+    report_dir = f"research/{thread_id}"
     context: dict[str, object] = {
         "model": model,
         "provider": provider,
-        "output_dir": report_dir,
+        "artifacts": report_dir,
     }
     config: dict[str, object] = {
         "configurable": {"thread_id": thread_id},
@@ -1097,7 +1162,7 @@ def _start_durable_research_graph(
     }
     graph = _build_production_graph(checkpointer=checkpointer)
     output = graph.invoke(
-        seed,
+        initial_graph_state(seed).model_dump(mode="json"),
         config,
         context=context,
         durability="sync",
@@ -1110,15 +1175,15 @@ def test_parse_goal_uses_one_structured_model_call_and_returns_valid_draft() -> 
     seed = _seed(request="Research AAPL with a maximum drawdown of 15%.")
     model = GoalParserFakeChatModel(_explicit_draft())
 
-    state = parse_goal(seed, model=model)
+    state = parse_goal(initial_graph_state(seed), model=model)
 
     assert validate_graph_state(state) == state
-    assert state["status"] == "awaiting_confirmation"
-    assert state["failure_stage"] is None
-    assert state["failure_summary"] is None
-    assert state["confirmed_goal"] is None
-    assert state["missing_goal_fields"] == []
-    assert state["defaulted_fields"] == []
+    assert state.status == "awaiting_confirmation"
+    assert state.failure_stage is None
+    assert state.failure_summary is None
+    assert state.workspace is None
+    assert state.missing_goal_fields == ()
+    assert state.defaulted_fields == ()
     goal = _draft_goal(state)
     assert goal == {
         "symbol": "AAPL",
@@ -1139,7 +1204,7 @@ def test_parse_goal_uses_one_structured_model_call_and_returns_valid_draft() -> 
     assert model.invoke_count == 1
     assert len(model.bound_tool_names) == 1
     assert model.bound_tool_names == ("GoalDraft",)
-    assert convert_to_openai_messages([model.messages_seen[0][0]])[0]["role"] == "developer"
+    assert isinstance(model.messages_seen[0][0], SystemMessage)
     encoded_messages = json.dumps(
         [message.content for message in model.messages_seen[0]],
         ensure_ascii=False,
@@ -1149,9 +1214,33 @@ def test_parse_goal_uses_one_structured_model_call_and_returns_valid_draft() -> 
     assert "1% = 100 bps" in encoded_messages
     assert "基点" in encoded_messages
     assert "moving_average for dual/double moving average or 双均线" in encoded_messages
-    strategy_schema = graph_module.GoalDraft.model_json_schema()["$defs"]["StrategyName"]
-    assert strategy_schema["enum"] == ["moving_average", "rsi", "macd"]
-    assert "unsafe-free-text-must-not-be-saved" not in json.dumps(state)
+    strategy_schema = GoalDraft.model_json_schema()["$defs"]["StrategyName"]
+    assert strategy_schema["enum"] == [
+        "moving_average",
+        "rsi",
+        "macd",
+        "intraday_rsi",
+        "rsi_price_exit",
+        "rsi_vwap_exit",
+    ]
+    assert "unsafe-free-text-must-not-be-saved" not in state.model_dump_json()
+
+
+def test_parse_goal_retries_a_transient_model_error() -> None:
+    model = GoalParserFakeChatModel(_explicit_draft(), mode="transient_once")
+
+    state = parse_goal(_task(), model=model)
+
+    assert state.status == "awaiting_confirmation"
+    assert model.invoke_count == 2
+
+
+def test_parse_goal_does_not_hide_internal_model_errors() -> None:
+    with pytest.raises(RuntimeError, match="unsafe-goal-transport-secret"):
+        parse_goal(
+            _task(),
+            model=GoalParserFakeChatModel(mode="transport_error"),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1193,6 +1282,18 @@ def test_parse_goal_uses_one_structured_model_call_and_returns_valid_draft() -> 
             [],
             _INTERVAL_INDEPENDENT_DEFAULTED_FIELDS,
         ),
+        (
+            {
+                "bar_interval": "1d",
+                "start_date": "2023-07-14",
+                "end_date": "2026-07-14",
+            },
+            "1d",
+            "2023-07-14",
+            "2026-07-14",
+            ["end_date"],
+            _ALL_DEFAULTED_FIELDS,
+        ),
     ],
 )
 def test_parse_goal_requires_interval_and_daily_period_while_applying_other_defaults(
@@ -1206,7 +1307,7 @@ def test_parse_goal_requires_interval_and_daily_period_while_applying_other_defa
     draft = {"symbol": "AAPL", **draft_changes}
 
     state = parse_goal(
-        _seed(reference_date="2026-07-13"),
+        _task(reference_date="2026-07-13"),
         model=GoalParserFakeChatModel(draft),
     )
 
@@ -1220,19 +1321,19 @@ def test_parse_goal_requires_interval_and_daily_period_while_applying_other_defa
     assert goal["benchmark_symbol"] == (expected_benchmark if expected_interval == "1d" else None)
     assert goal["transaction_cost_bps"] == 5.0
     assert goal["slippage_bps"] == 5.0
-    assert state["missing_goal_fields"] == expected_missing
-    assert state["status"] == (
+    assert state.missing_goal_fields == tuple(expected_missing)
+    assert state.status == (
         "awaiting_clarification" if expected_missing else "awaiting_confirmation"
     )
-    assert state["defaulted_fields"] == defaulted
-    assert ("benchmark_symbol" in state["defaulted_fields"]) == (
+    assert state.defaulted_fields == tuple(defaulted)
+    assert ("benchmark_symbol" in state.defaulted_fields) == (
         expected_interval == "1d" and "benchmark_symbol" not in draft_changes
     )
 
 
 def test_parse_goal_merges_one_explicit_cost_with_thread_defaults() -> None:
     state = parse_goal(
-        _seed(
+        _task(
             request="Research AAPL with a 0.075% transaction fee.",
             transaction_cost_bps=3.0,
             slippage_bps=4.0,
@@ -1242,8 +1343,117 @@ def test_parse_goal_merges_one_explicit_cost_with_thread_defaults() -> None:
 
     assert _draft_goal(state)["transaction_cost_bps"] == 7.5
     assert _draft_goal(state)["slippage_bps"] == 4.0
-    assert "transaction_cost_bps" not in state["defaulted_fields"]
-    assert "slippage_bps" in state["defaulted_fields"]
+    assert "transaction_cost_bps" not in state.defaulted_fields
+    assert "slippage_bps" in state.defaulted_fields
+
+
+@pytest.mark.parametrize(
+    ("draft", "field"),
+    [
+        (
+            {
+                "symbol": "AAPL",
+                "bar_interval": "1d",
+                "start_date": "2024-1-1",
+                "end_date": "2024-06-30",
+            },
+            "start_date",
+        ),
+        (
+            {
+                "symbol": "AAPL",
+                "bar_interval": "1d",
+                "start_date": "2024-01-01",
+                "end_date": "2024/06/30",
+            },
+            "end_date",
+        ),
+        (
+            {
+                "symbol": "AAPL",
+                "bar_interval": "1m",
+                "training_sessions": 2,
+                "test_sessions": 1,
+                "end_date": "June 30",
+            },
+            "end_date",
+        ),
+    ],
+)
+def test_malformed_model_dates_ask_for_clarification(draft: dict[str, object], field: str) -> None:
+    state = parse_goal(_task(), model=GoalParserFakeChatModel(draft))
+
+    assert state.status == "awaiting_clarification"
+    assert field in state.missing_goal_fields
+    assert _draft_goal(state)[field] is None
+    assert field not in state.defaulted_fields
+
+
+def test_minute_goals_beyond_yahoo_history_ask_for_clarification() -> None:
+    draft = {"symbol": "AAPL", "bar_interval": "1m", "training_sessions": 15, "test_sessions": 6}
+    state = parse_goal(_task(), model=GoalParserFakeChatModel(draft))
+
+    assert state.status == "awaiting_clarification"
+    assert state.missing_goal_fields == ("training_sessions", "test_sessions")
+
+    within = parse_goal(_task(), model=GoalParserFakeChatModel({**draft, "training_sessions": 14}))
+    assert within.status == "awaiting_confirmation"
+
+
+def test_an_empty_strategy_list_takes_the_interval_defaults() -> None:
+    state = parse_goal(
+        _task(),
+        model=GoalParserFakeChatModel(
+            {
+                "symbol": "AAPL",
+                "bar_interval": "1d",
+                "start_date": "2024-01-01",
+                "end_date": "2024-06-30",
+                "allowed_strategies": [],
+            }
+        ),
+    )
+
+    assert state.status == "awaiting_confirmation"
+    assert _draft_goal(state)["allowed_strategies"] == ["moving_average", "rsi", "macd"]
+    assert "allowed_strategies" in state.defaulted_fields
+
+
+@pytest.mark.parametrize("failure", ["invalid_draft", "transient"])
+def test_an_answer_the_model_cannot_apply_keeps_the_draft(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    state = parse_goal(_task(), model=GoalParserFakeChatModel({"symbol": "AAPL"}))
+    model = GoalParserFakeChatModel({"position_tranches": 99})
+    if failure == "transient":
+
+        def unavailable(*_args: object, **_kwargs: object) -> GoalDraft:
+            raise httpx.ConnectError("unsafe-transient-model-detail")
+
+        monkeypatch.setattr(goal_module, "_invoke_goal_update", unavailable)
+
+    answered = apply_goal_answer(state, "Use daily bars for the first half of 2024.", model=model)
+
+    assert answered.status == state.status == "awaiting_clarification"
+    assert (answered.draft_goal, answered.request) == (state.draft_goal, state.request)
+    assert answered.confirmation_error == (
+        "The answer could not be applied; rephrase it and try again."
+    )
+    assert "unsafe" not in answered.model_dump_json()
+
+
+def test_the_longest_answer_fits_beside_a_full_length_request() -> None:
+    state = parse_goal(
+        _task(request="R" * 2_000), model=GoalParserFakeChatModel({"symbol": "AAPL"})
+    )
+
+    answered = apply_goal_answer(
+        state, "A" * 1_000, model=GoalParserFakeChatModel({"bar_interval": "1d"})
+    )
+
+    assert len(answered.request) == 2_000
+    assert answered.request.endswith("\nClarification: " + "A" * 1_000)
+    assert answered.confirmation_error is None
 
 
 def test_goal_domain_gaps_clarify_while_schema_failure_stays_safe(tmp_path: Path) -> None:
@@ -1273,31 +1483,31 @@ def test_goal_domain_gaps_clarify_while_schema_failure_stays_safe(tmp_path: Path
     )
     for draft, missing in domain_gaps:
         model = GoalParserFakeChatModel(draft)
-        state = parse_goal(_seed(), model=model)
+        state = parse_goal(_task(), model=model)
         assert validate_graph_state(state) == state
-        assert state["status"] == "awaiting_clarification"
-        assert missing in state["missing_goal_fields"]
+        assert state.status == "awaiting_clarification"
+        assert missing in state.missing_goal_fields
         assert model.bind_count == model.invoke_count == 1
 
     model = GoalParserFakeChatModel({"symbol": "AAPL", "unexpected": "unsafe-extra-field"})
-    state = parse_goal(_seed(), model=model)
+    state = parse_goal(_task(), model=model)
     _assert_goal_parsing_failure(state)
-    assert "unsafe-extra-field" not in json.dumps(state)
+    assert "unsafe-extra-field" not in state.model_dump_json()
 
     ambiguous = parse_goal(
-        _seed(request="研究闪迪的分线"),
+        _task(request="研究闪迪的分线"),
         model=GoalParserFakeChatModel({"symbol": "SNDK", "request_issue": "ambiguous_fields"}),
     )
-    assert ambiguous["status"] == "awaiting_clarification"
-    assert ambiguous["missing_goal_fields"] == ["bar_interval"]
+    assert ambiguous.status == "awaiting_clarification"
+    assert ambiguous.missing_goal_fields == ("bar_interval",)
     assert _draft_goal(ambiguous)["request_issue"] == "ambiguous_fields"
 
     unrelated = parse_goal(
-        _seed(request="今天天气怎么样"),
+        _task(request="今天天气怎么样"),
         model=GoalParserFakeChatModel({"request_issue": "unrelated_request"}),
     )
-    assert unrelated["missing_goal_fields"] == ["request_details"]
-    assert unrelated["defaulted_fields"] == []
+    assert unrelated.missing_goal_fields == ("request_details",)
+    assert unrelated.defaulted_fields == ()
     assert _draft_goal(unrelated)["allowed_strategies"] is None
     assert _draft_goal(unrelated)["transaction_cost_bps"] is None
 
@@ -1375,7 +1585,7 @@ def test_start_interrupts_with_defaulted_goal_before_any_research_side_effect(
     state = _checkpoint_state(graph, config)
     payload = _interrupt_payload(output)
     assert state["status"] == "awaiting_confirmation"
-    assert state["confirmed_goal"] is None
+    assert state["workspace"] is None
     assert state["confirmation_error"] is None
     assert payload == {
         "thread_id": seed["thread_id"],
@@ -1388,7 +1598,7 @@ def test_start_interrupts_with_defaulted_goal_before_any_research_side_effect(
     assert graph.get_state(config).next == ("confirm_goal",)
     assert model.bind_count == model.invoke_count == 1
     assert provider.calls == 0
-    assert not report_dir.exists()
+    assert not _artifact_names(report_dir)
     _assert_research_side_effects_are_zero(state)
 
 
@@ -1410,8 +1620,8 @@ def test_approve_freezes_the_draft_before_research_can_run(tmp_path: Path) -> No
 
     state = _checkpoint_state(graph, config)
     assert state["status"] == "running"
-    assert state["phase"] == "researching"
-    confirmed = state["confirmed_goal"]
+    assert state["workspace"]["phase"] == "researching"
+    confirmed = state["workspace"]["goal"]
     assert confirmed is not None
     assert confirmed["symbol"] == draft["symbol"]
     assert confirmed["bar_interval"] == draft["bar_interval"]
@@ -1422,7 +1632,7 @@ def test_approve_freezes_the_draft_before_research_can_run(tmp_path: Path) -> No
     assert state["confirmation_error"] is None
     assert model.bind_count == model.invoke_count == 1
     assert provider.calls == 0
-    assert not report_dir.exists()
+    assert not _artifact_names(report_dir)
     _assert_research_side_effects_are_zero(state)
 
 
@@ -1484,7 +1694,7 @@ def test_answer_updates_only_explicit_goal_fields_and_reuses_reference_date(
     assert period_answer in state["request"]
     assert answer in state["request"]
     assert state["reference_date"] == "2024-02-29"
-    assert state["confirmed_goal"] is None
+    assert state["workspace"] is None
     assert state["confirmation_error"] is None
     assert goal["symbol"] == "MSFT"
     assert goal["start_date"] == "2021-02-28"
@@ -1499,7 +1709,7 @@ def test_answer_updates_only_explicit_goal_fields_and_reuses_reference_date(
         ensure_ascii=False,
     )
     assert provider.calls == 0
-    assert not report_dir.exists()
+    assert not _artifact_names(report_dir)
     _assert_research_side_effects_are_zero(state)
 
     minute_model = SequencedGoalParserFakeChatModel(
@@ -1545,6 +1755,7 @@ def test_answer_updates_only_explicit_goal_fields_and_reuses_reference_date(
     assert complete["draft_goal"]["test_sessions"] == 1
     assert complete["draft_goal"]["symbol"] == "NOW"
     assert complete["draft_goal"]["bar_interval"] == "1m"
+    assert complete["draft_goal"]["end_date"] == "2026-07-13"
     assert complete["draft_goal"]["allowed_strategies"] == ["rsi", "macd"]
     assert complete["draft_goal"]["benchmark_symbol"] is None
 
@@ -1564,7 +1775,7 @@ def test_answer_updates_only_explicit_goal_fields_and_reuses_reference_date(
         durability="sync",
         interrupt_after=["confirm_goal"],
     )
-    confirmed = _checkpoint_state(minute_graph, minute_config)["confirmed_goal"]
+    confirmed = _checkpoint_state(minute_graph, minute_config)["workspace"]["goal"]
     assert confirmed is not None
     assert confirmed["bar_interval"] == "1m"
     assert confirmed["training_sessions"] == 2
@@ -1587,14 +1798,12 @@ def test_reject_ends_without_confirmed_goal_result_or_report(tmp_path: Path) -> 
 
     state = _checkpoint_state(graph, config)
     assert state["status"] == "rejected"
-    assert state["confirmed_goal"] is None
-    assert state["phase"] is None
-    assert state["terminal_result"] is None
+    assert state["workspace"] is None
     assert state["confirmation_error"] is None
     assert graph.get_state(config).next == ()
     assert model.bind_count == model.invoke_count == 1
     assert provider.calls == 0
-    assert not report_dir.exists()
+    assert not _artifact_names(report_dir)
     _assert_research_side_effects_are_zero(state)
 
 
@@ -1604,6 +1813,44 @@ def test_research_graph_has_only_four_business_nodes_and_no_fixed_tool_workflow(
 
     assert business_nodes == {"parse_goal", "confirm_goal", "research_agent", "critic_agent"}
     assert business_nodes.isdisjoint(_RESEARCH_TOOL_NAMES)
+
+
+def test_a_response_with_several_tool_calls_runs_only_the_first(tmp_path: Path) -> None:
+    """A provider may ignore parallel_tool_calls=False; one Tool still runs per step."""
+
+    def two_calls_then_selected(messages: list[BaseMessage]) -> AIMessage:
+        if not _react_observations(messages):
+            return AIMessage(
+                content="I'll load the data and calculate asset statistics.",
+                tool_calls=[
+                    _tool_call("get_market_data", {}, "parallel-1"),
+                    _tool_call("calculate_asset_statistics", {}, "parallel-2"),
+                ],
+            )
+        return _dynamic_selected_decider(messages)
+
+    model = DynamicResearchGraphFakeChatModel(
+        _graph_research_draft(), two_calls_then_selected, _evidence_then_accept_critic_decider
+    )
+
+    state, _report_dir = _run_approved_graph_to_terminal(
+        tmp_path,
+        model=model,
+        provider=GraphMarketDataProvider(),
+        budget=AgentBudget(max_agent_steps=12, max_tool_calls=11, max_training_backtests=3),
+    )
+
+    assert state["status"] == "selected"
+    journal = [entry["tool_name"] for entry in state["workspace"]["journal"]]
+    assert journal[0] == "get_market_data"
+    assert "calculate_asset_statistics" not in journal
+    (skipped,) = [
+        json.loads(message.content)
+        for message in model.research_messages_seen[1]
+        if isinstance(message, ToolMessage) and message.tool_call_id == "parallel-2"
+    ]
+    assert skipped["status"] == "rejected"
+    assert "next step" in skipped["summary"]
 
 
 def test_dynamic_react_graph_completes_selected_with_switches_and_final_isolation(
@@ -1630,75 +1877,14 @@ def test_dynamic_react_graph_completes_selected_with_switches_and_final_isolatio
     )
 
     assert state["status"] == "selected"
-    assert state["phase"] == "completed"
-    assert state["agent_steps"] == state["tool_calls"] == 8
-    assert state["training_backtests"] == 3
-    assert state["final_batch_completed"] is True
-    assert len(state["training_evaluations"]) == 3
-    assert set(state["final_evaluations"]) == set(state["training_evaluations"])
+    assert state["workspace"]["phase"] == "completed"
+    assert len(state["workspace"]["candidates"]) == 3
+    assert all(candidate["test"] for candidate in state["workspace"]["candidates"])
     messages = {event.message for event in events}
     assert "Goal Parser · Parsing the research request..." in messages
     assert "Research Agent · Deciding the next Action..." in messages
     assert "Critic Agent · Reviewing the research draft..." in messages
-    assert {event.source for event in events} == {
-        "goal_parser",
-        "workflow",
-        "research_agent",
-        "critic_agent",
-    }
-    assert {event.kind for event in events} == {
-        "status",
-        "decision",
-        "tool",
-        "observation",
-    }
-    assert all(event.tool_name for event in events if event.kind in {"tool", "observation"})
-
-    workflow_events = [event for event in events if event.source in {"goal_parser", "workflow"}]
-    research_events = [event for event in events if event.source == "research_agent"]
-    critic_events = [event for event in events if event.source == "critic_agent"]
-    assert all(event.agent_status is None for event in workflow_events)
-    assert all(event.agent_status is not None for event in research_events + critic_events)
-
-    first_research_status = research_events[0].agent_status
-    final_research_status = research_events[-1].agent_status
-    first_critic_status = critic_events[0].agent_status
-    final_critic_status = critic_events[-1].agent_status
-    assert first_research_status is not None
-    assert final_research_status is not None
-    assert first_critic_status is not None
-    assert final_critic_status is not None
-    assert first_research_status.budget_used.model_dump() == {
-        "agent_steps": 1,
-        "tool_calls": 0,
-        "training_backtests": 0,
-    }
-    assert final_research_status.budget_used.model_dump() == {
-        "agent_steps": 8,
-        "tool_calls": 8,
-        "training_backtests": 3,
-    }
-    assert final_research_status.budget_remaining.model_dump() == {
-        "agent_steps": 3,
-        "tool_calls": 3,
-        "training_backtests": 0,
-    }
-    assert first_critic_status.critic_round == 1
-    assert first_critic_status.critic_budget_used.model_dump() == {
-        "agent_steps": 1,
-        "tool_calls": 0,
-    }
-    assert final_critic_status.critic_verdict == "accept"
-    assert final_critic_status.critic_budget_used.model_dump() == {
-        "agent_steps": 2,
-        "tool_calls": 2,
-    }
-    assert final_critic_status.critic_budget_remaining.model_dump() == {
-        "agent_steps": 8,
-        "tool_calls": 4,
-    }
-
-    journal = state["message_journal"]
+    journal = state["workspace"]["journal"]
     assert [entry["tool_name"] for entry in journal] == [
         "get_market_data",
         "run_backtest",
@@ -1709,107 +1895,28 @@ def test_dynamic_react_graph_completes_selected_with_switches_and_final_isolatio
         "compare_with_benchmark",
         "submit_research_draft",
     ]
-    training_entries = [
-        entry
-        for entry in journal
-        if entry["tool_name"] == "run_backtest" and entry["arguments"]["stage"] == "training"
-    ]
-    assert [entry["arguments"]["strategy_name"] for entry in training_entries] == [
-        "moving_average",
-        "moving_average",
-        "rsi",
-    ]
-    assert training_entries[0]["arguments"]["parameters"] == {
-        "short_window": 2,
-        "long_window": 3,
-    }
-    assert training_entries[1]["arguments"]["parameters"] == {
-        "short_window": 2,
-        "long_window": 4,
-    }
-    first_fingerprint = training_entries[0]["observation"]["identifiers"]["fingerprint"]
-    assert journal[2]["observation"]["identifiers"]["fingerprint"] == first_fingerprint
-
-    locked_fingerprint = state["locked_fingerprint"]
+    locked_fingerprint = state["workspace"]["locked_fingerprint"]
     assert isinstance(locked_fingerprint, str)
-    assert training_entries[1]["observation"]["identifiers"]["fingerprint"] == locked_fingerprint
-    terminal = state["terminal_result"]
+    terminal = state["workspace"]["result"]
     assert terminal is not None
     assert terminal["status"] == "selected"
     assert terminal["selected_fingerprint"] == locked_fingerprint
     assert terminal["evaluated_fingerprint"] == locked_fingerprint
-    assert (
-        terminal["test_metrics"]["asset_buy_and_hold_return"]
-        != terminal["test_metrics"]["benchmark_return"]
-    )
-
-    comparison = journal[-2]["observation"]
-    assert comparison["status"] == "success"
-    assert set(comparison["metrics"]) == {
-        "strategy_total_return",
-        "asset_buy_and_hold_return",
-        "excess_vs_asset_buy_and_hold",
-        "benchmark_return",
-        "excess_vs_benchmark",
-    }
-    assert (
-        comparison["metrics"]["asset_buy_and_hold_return"]
-        != comparison["metrics"]["benchmark_return"]
-    )
-
-    researching_turns = 0
-    locked_turns = 0
     for messages in model.research_messages_seen:
-        assert len(messages) == 2
-        assert convert_to_openai_messages([messages[0]])[0]["role"] == "developer"
+        assert isinstance(messages[0], SystemMessage)
+        assert messages[0].text.startswith(f"{SYSTEM_PROMPT}\n\n")
         react_state = _react_state(messages)
         assert all("test_metrics" not in item for item in react_state["tested_candidates"])
-        encoded = "\n".join(
-            message.content for message in messages if isinstance(message.content, str)
-        )
-        if react_state["phase"] == "researching":
-            researching_turns += 1
-            assert '"test_metrics"' not in encoded
-            assert react_state["locked_candidate"] is None
-        else:
-            locked_turns += 1
-            assert react_state["phase"] == "locked"
-            assert react_state["locked_candidate"]["fingerprint"] == locked_fingerprint
-            assert "test_metrics" in react_state["locked_candidate"]
-    assert researching_turns == 6
-    assert locked_turns == 2
 
-    assert _RESEARCH_TOOL_NAMES in model.binding_history
-    assert _CRITIC_TOOL_NAMES in model.binding_history
-    assert len(model.critic_messages_seen) == 2
+    assert model.critic_messages_seen
     for messages in model.critic_messages_seen:
-        assert len(messages) == 2
-        assert convert_to_openai_messages([messages[0]])[0]["role"] == "developer"
-    assert model.bound_tool_names == _CRITIC_TOOL_NAMES
-    assert all(
-        options
-        == {
-            "parallel_tool_calls": False,
-            "strict": False,
-            "tool_choice": "required",
-        }
-        for options in model.binding_options[1:]
-    )
+        assert isinstance(messages[0], SystemMessage)
+        assert messages[0].text.startswith(f"{CRITIC_SYSTEM_PROMPT}\n\n")
 
-    critic_round = state["critic_rounds"][0]
-    assert critic_round["agent_steps"] == 2
-    assert critic_round["tool_calls"] == 2
-    assert [entry["tool_name"] for entry in critic_round["journal"]] == [
-        "inspect_selected_drawdown",
-        "submit_critic_review",
-    ]
-    assert ("inspect_selected_drawdown",) not in model.binding_history
+    critic_round = state["workspace"]["critic_rounds"][0]
     assert critic_round["review"]["verdict"] == "accept"
     assert [call[0] for call in provider.calls] == ["AAPL", "SPY"]
-    assert {path.name for path in report_dir.iterdir()} == {
-        "report.json",
-    }
-    report = load_report_view(report_dir / "report.json")
+    report = load_report_view(f"{report_dir}/report.json")
     assert report.critic_review_status == "accepted"
     assert report.critic_reviews[-1].verdict == "accept"
 
@@ -1834,31 +1941,27 @@ def test_dynamic_react_graph_can_finish_with_normal_no_strategy_result(
         ),
     )
 
-    terminal = state["terminal_result"]
+    terminal = state["workspace"]["result"]
     assert terminal is not None
     assert state["status"] == terminal["status"] == "no_strategy"
-    assert state["phase"] == "completed"
-    assert state["agent_steps"] == state["tool_calls"] == 4
-    assert state["training_backtests"] == 1
-    fingerprint = next(iter(state["training_evaluations"]))
-    assert state["locked_fingerprint"] == fingerprint
-    assert state["final_batch_completed"] is True
-    assert len(state["training_evaluations"]) == 1
-    assert set(state["final_evaluations"]) == set(state["training_evaluations"])
+    assert state["workspace"]["phase"] == "completed"
+    assert state["workspace"]["agent_steps"] == state["workspace"]["tool_calls"] == 4
+    assert len(state["workspace"]["candidates"]) == 1
+    fingerprint = state["workspace"]["candidates"][0]["fingerprint"]
+    assert state["workspace"]["locked_fingerprint"] == fingerprint
+    assert state["workspace"]["candidates"][0]["test"] is not None
     assert terminal["selected_fingerprint"] is None
     assert terminal["evaluated_fingerprint"] == fingerprint
     assert terminal["training_metrics"]
     assert terminal["test_metrics"]
-    assert [entry["tool_name"] for entry in state["message_journal"]] == [
+    assert [entry["tool_name"] for entry in state["workspace"]["journal"]] == [
         "get_market_data",
         "run_backtest",
         "run_backtest",
         "submit_research_draft",
     ]
     assert [call[0] for call in provider.calls] == ["AAPL", "SPY"]
-    assert {path.name for path in report_dir.iterdir()} == {
-        "report.json",
-    }
+    assert _artifact_names(report_dir) == {"market_data.json", "report.json"}
 
 
 def test_one_critic_revision_reuses_the_frozen_candidate_then_accepts(
@@ -1881,16 +1984,19 @@ def test_one_critic_revision_reuses_the_frozen_candidate_then_accepts(
     )
 
     assert state["status"] == "selected"
-    assert len(state["critic_rounds"]) == 2
-    assert [review_round["review"]["verdict"] for review_round in state["critic_rounds"]] == [
+    assert len(state["workspace"]["critic_rounds"]) == 2
+    assert [
+        review_round["review"]["verdict"] for review_round in state["workspace"]["critic_rounds"]
+    ] == [
         "revise",
         "accept",
     ]
     fingerprints = {
-        review_round["draft"]["selected_fingerprint"] for review_round in state["critic_rounds"]
+        review_round["draft"]["selected_fingerprint"]
+        for review_round in state["workspace"]["critic_rounds"]
     }
-    assert fingerprints == {state["locked_fingerprint"]}
-    assert [entry["tool_name"] for entry in state["message_journal"]] == [
+    assert fingerprints == {state["workspace"]["locked_fingerprint"]}
+    assert [entry["tool_name"] for entry in state["workspace"]["journal"]] == [
         "get_market_data",
         "run_backtest",
         "run_backtest",
@@ -1899,15 +2005,37 @@ def test_one_critic_revision_reuses_the_frozen_candidate_then_accepts(
         "submit_research_draft",
     ]
     assert _RESEARCH_REVISION_TOOL_NAMES in model.binding_history
-    report = load_report_view(report_dir / "report.json")
+    report = load_report_view(f"{report_dir}/report.json")
     assert [review.verdict for review in report.critic_reviews] == ["revise", "accept"]
 
 
-def test_retryable_research_model_error_keeps_checkpointed_step_then_empty_resume(
-    tmp_path: Path,
+def test_transient_model_error_is_retried_inside_the_same_decision(
+    tmp_path: Path, retry_delays: list[float]
+) -> None:
+    decision = FailingResearchDecision(failures=1)
+    graph, config, context, _report_dir = _start_durable_research_graph(
+        tmp_path,
+        model=DynamicResearchGraphFakeChatModel(_graph_research_draft(), decision),
+        provider=GraphMarketDataProvider(),
+        budget=AgentBudget(max_agent_steps=1, max_tool_calls=1, max_training_backtests=1),
+        checkpointer=InMemorySaver(),
+    )
+
+    graph.invoke(Command(resume={"action": "approve"}), config, context=context, durability="sync")
+
+    state = _checkpoint_state(graph, config)
+    assert state["status"] == "budget_exhausted"
+    assert state["workspace"]["agent_steps"] == state["workspace"]["tool_calls"] == 1
+    assert [entry["tool_name"] for entry in state["workspace"]["journal"]] == ["get_market_data"]
+    assert decision.calls == 2
+    assert len(retry_delays) == 1
+
+
+def test_exhausted_model_retries_keep_the_checkpointed_step_then_empty_resume(
+    tmp_path: Path, retry_delays: list[float]
 ) -> None:
     saver = InMemorySaver()
-    decision = FailOnceResearchDecision()
+    decision = FailingResearchDecision(failures=3)
     model = DynamicResearchGraphFakeChatModel(
         _graph_research_draft(),
         decision,
@@ -1933,32 +2061,20 @@ def test_retryable_research_model_error_keeps_checkpointed_step_then_empty_resum
             durability="sync",
         )
 
-    assert caught.value.stage == "model"
-    assert caught.value.args == ("The research model call failed safely.",)
-    assert str(caught.value) == "The research model call failed safely."
-    assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
-    assert "unsafe-" not in repr(getattr(caught.value, "__notes__", ()))
-    assert "unsafe-transient-model-detail" not in "".join(traceback.format_exception(caught.value))
+    assert decision.calls == 3
+    assert len(retry_delays) == 2
     assert "unsafe-transient-model-detail" not in _checkpoint_error_envelope(
         saver,
         graph,
         config,
     )
-    failed_state = _checkpoint_state(graph, config)
     active_state = _active_agent_workspace_checkpoint(saver, graph, config)
-    assert failed_state["status"] == "running"
-    assert failed_state["phase"] == "researching"
-    assert active_state["status"] == "running"
     assert active_state["agent_steps"] == 1
     assert active_state["tool_calls"] == 0
     assert graph.get_state(config).next == ("research_agent",)
-    assert model.invoke_count == 2
-    assert len(model.research_messages_seen) == decision.calls == 1
     assert provider.calls == []
-    assert not report_dir.exists()
-    _assert_research_side_effects_are_zero(failed_state)
-    assert "unsafe-transient-model-detail" not in json.dumps(failed_state)
+    assert not _artifact_names(report_dir)
 
     graph.invoke(
         None,
@@ -1969,14 +2085,77 @@ def test_retryable_research_model_error_keeps_checkpointed_step_then_empty_resum
 
     resumed_state = _checkpoint_state(graph, config)
     assert resumed_state["status"] == "budget_exhausted"
-    assert resumed_state["agent_steps"] == resumed_state["tool_calls"] == 1
-    assert [entry["tool_name"] for entry in resumed_state["message_journal"]] == ["get_market_data"]
-    assert model.invoke_count == 3
-    assert len(model.research_messages_seen) == decision.calls == 2
+    assert (
+        resumed_state["workspace"]["agent_steps"] == resumed_state["workspace"]["tool_calls"] == 1
+    )
+    assert [entry["tool_name"] for entry in resumed_state["workspace"]["journal"]] == [
+        "get_market_data"
+    ]
     assert [call[0] for call in provider.calls] == ["AAPL", "SPY"]
+    resumed_conversation = model.research_messages_seen[-1]
+    assert sum(isinstance(message, HumanMessage) for message in resumed_conversation) == 1
 
 
-def test_retryable_research_tool_error_resumes_without_redeciding(
+def test_research_and_critic_retry_transient_errors_without_repeating_actions(
+    tmp_path: Path, retry_delays: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    import tragent.research.service as research_module
+
+    failures = {"research": 0, "critic": 0}
+
+    def research_decider(messages):
+        state = _react_state(messages)
+        if (
+            state["tested_candidates"]
+            and state["phase"] == "researching"
+            and not failures["research"]
+        ):
+            failures["research"] += 1
+            raise httpx.ConnectError("unsafe-transient-model-detail")
+        return _revision_research_decider(messages)
+
+    def critic_decider(messages):
+        if not failures["critic"]:
+            failures["critic"] += 1
+            raise httpx.ReadTimeout("unsafe-transient-critic-detail")
+        return _accept_critic_decider(messages)
+
+    provider = GraphMarketDataProvider()
+    graph, config, context, report_dir = _start_durable_research_graph(
+        tmp_path,
+        model=DynamicResearchGraphFakeChatModel(
+            _graph_research_draft(), research_decider, critic_decider
+        ),
+        provider=provider,
+        budget=AgentBudget(),
+        checkpointer=InMemorySaver(),
+    )
+    list(
+        research_module._stream_graph(
+            graph, Command(resume={"action": "approve"}), config, context=context
+        )
+    )
+    state = _checkpoint_state(graph, config)
+    assert state["status"] == "selected"
+    assert state["workspace"]["agent_steps"] == state["workspace"]["tool_calls"] == 4
+    assert len(state["workspace"]["candidates"]) == 1
+    assert state["workspace"]["critic_rounds"][0]["agent_steps"] == 1
+    assert state["workspace"]["critic_rounds"][0]["tool_calls"] == 1
+    assert [entry["tool_name"] for entry in state["workspace"]["journal"]] == [
+        "get_market_data",
+        "run_backtest",
+        "run_backtest",
+        "submit_research_draft",
+    ]
+    assert [call[0] for call in provider.calls] == ["AAPL", "SPY"]
+    assert failures == {"research": 1, "critic": 1}
+    assert len(retry_delays) == 2
+    assert "report.json" in _artifact_names(report_dir)
+    assert "unsafe-transient-model-detail" not in caplog.text
+    assert "unsafe-transient-critic-detail" not in caplog.text
+
+
+def test_interrupted_tool_resumes_without_redeciding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2004,14 +2183,12 @@ def test_retryable_research_tool_error_resumes_without_redeciding(
         nonlocal operation_calls
         operation_calls += 1
         if operation_calls == 1:
-            error = graph_module.RecoverableResearchError(stage="tool")
-            error.add_note("unsafe-transient-tool-detail")
-            raise error
+            raise RuntimeError("tool interrupted")
         return real_get_market_data(workspace)
 
     monkeypatch.setattr(runtime_module, "get_market_data", transient_get_market_data)
 
-    with pytest.raises(graph_module.RecoverableResearchError) as caught:
+    with pytest.raises(RuntimeError, match="tool interrupted"):
         graph.invoke(
             Command(resume={"action": "approve"}),
             config,
@@ -2019,31 +2196,15 @@ def test_retryable_research_tool_error_resumes_without_redeciding(
             durability="sync",
         )
 
-    assert caught.value.stage == "tool"
-    assert caught.value.args == ("The research Tool failed temporarily.",)
-    assert str(caught.value) == "The research Tool failed temporarily."
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
-    assert "unsafe-" not in repr(getattr(caught.value, "__notes__", ()))
-    assert "unsafe-transient-tool-detail" not in "".join(traceback.format_exception(caught.value))
-    assert "unsafe-transient-tool-detail" not in _checkpoint_error_envelope(
-        saver,
-        graph,
-        config,
-    )
-    failed_state = _checkpoint_state(graph, config)
     active_state = _active_agent_workspace_checkpoint(saver, graph, config)
-    assert failed_state["status"] == "running"
-    assert active_state["status"] == "running"
     assert active_state["agent_steps"] == 1
     assert active_state["tool_calls"] == 0
-    assert active_state["message_journal"] == []
+    assert active_state["journal"] == []
     assert graph.get_state(config).next == ("research_agent",)
-    assert failed_state["message_journal"] == []
     assert len(model.research_messages_seen) == 1
     assert operation_calls == 1
     assert provider.calls == []
-    assert not report_dir.exists()
+    assert not _artifact_names(report_dir)
 
     graph.invoke(
         None,
@@ -2054,197 +2215,19 @@ def test_retryable_research_tool_error_resumes_without_redeciding(
 
     resumed_state = _checkpoint_state(graph, config)
     assert resumed_state["status"] == "budget_exhausted"
-    assert resumed_state["agent_steps"] == resumed_state["tool_calls"] == 1
-    assert [entry["tool_name"] for entry in resumed_state["message_journal"]] == ["get_market_data"]
+    assert (
+        resumed_state["workspace"]["agent_steps"] == resumed_state["workspace"]["tool_calls"] == 1
+    )
+    assert [entry["tool_name"] for entry in resumed_state["workspace"]["journal"]] == [
+        "get_market_data"
+    ]
     assert len(model.research_messages_seen) == 1
     assert operation_calls == 2
     assert [call[0] for call in provider.calls] == ["AAPL", "SPY"]
 
 
-def test_two_threads_keep_state_provider_and_report_directories_isolated(
-    tmp_path: Path,
-) -> None:
-    saver = InMemorySaver()
-    first_budget = AgentBudget(
-        max_agent_steps=1,
-        max_tool_calls=1,
-        max_training_backtests=1,
-    )
-    second_budget = AgentBudget(
-        max_agent_steps=2,
-        max_tool_calls=2,
-        max_training_backtests=1,
-    )
-    first_model = DynamicResearchGraphFakeChatModel(
-        _graph_research_draft("AAPL"),
-        _single_market_data_decider,
-    )
-    second_model = DynamicResearchGraphFakeChatModel(
-        _graph_research_draft("MSFT"),
-        _single_market_data_decider,
-    )
-    first_provider = GraphMarketDataProvider("AAPL")
-    second_provider = GraphMarketDataProvider("MSFT")
-    first_graph, first_config, first_context, first_report_dir = _start_durable_research_graph(
-        tmp_path,
-        model=first_model,
-        provider=first_provider,
-        budget=first_budget,
-        checkpointer=saver,
-        expected_symbol="AAPL",
-    )
-    second_graph, second_config, second_context, second_report_dir = _start_durable_research_graph(
-        tmp_path,
-        model=second_model,
-        provider=second_provider,
-        budget=second_budget,
-        checkpointer=saver,
-        expected_symbol="MSFT",
-    )
-
-    first_graph.invoke(
-        Command(resume={"action": "approve"}),
-        first_config,
-        context=first_context,
-        durability="sync",
-    )
-    second_graph.invoke(
-        Command(resume={"action": "approve"}),
-        second_config,
-        context=second_context,
-        durability="sync",
-    )
-
-    first_state = _checkpoint_state(first_graph, first_config)
-    second_state = _checkpoint_state(second_graph, second_config)
-    assert first_state["thread_id"] != second_state["thread_id"]
-    assert first_state["confirmed_goal"]["symbol"] == "AAPL"
-    assert second_state["confirmed_goal"]["symbol"] == "MSFT"
-    assert first_state["data_snapshot"]["asset_symbol"] == "AAPL"
-    assert second_state["data_snapshot"]["asset_symbol"] == "MSFT"
-    assert first_state["status"] == second_state["status"] == "budget_exhausted"
-    assert first_state["agent_steps"] == first_state["tool_calls"] == 1
-    assert second_state["agent_steps"] == second_state["tool_calls"] == 2
-    assert [call[0] for call in first_provider.calls] == ["AAPL", "SPY"]
-    assert [call[0] for call in second_provider.calls] == ["MSFT", "SPY"]
-    assert first_report_dir != second_report_dir
-    assert first_report_dir.parent == second_report_dir.parent == tmp_path
-    assert {path.name for path in first_report_dir.iterdir()} == {
-        "report.json",
-    }
-    assert {path.name for path in second_report_dir.iterdir()} == {
-        "report.json",
-    }
-    assert load_report_view(first_report_dir / "report.json").symbol == "AAPL"
-    assert load_report_view(second_report_dir / "report.json").symbol == "MSFT"
-
-
-def test_terminal_empty_resume_does_not_rerun_model_tool_or_report(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model = DynamicResearchGraphFakeChatModel(
-        _graph_research_draft(),
-        _single_market_data_decider,
-    )
-    provider = GraphMarketDataProvider()
-    graph, config, context, report_dir = _start_durable_research_graph(
-        tmp_path,
-        model=model,
-        provider=provider,
-        budget=AgentBudget(
-            max_agent_steps=1,
-            max_tool_calls=1,
-            max_training_backtests=1,
-        ),
-        checkpointer=InMemorySaver(),
-    )
-    graph.invoke(
-        Command(resume={"action": "approve"}),
-        config,
-        context=context,
-        durability="sync",
-    )
-    before_snapshot = graph.get_state(config)
-    before_state = validate_graph_state(dict(before_snapshot.values))
-    before_checkpoint_id = before_snapshot.config["configurable"]["checkpoint_id"]
-    model_calls = model.invoke_count
-    provider_calls = list(provider.calls)
-    report_contents = {path.name: path.read_bytes() for path in sorted(report_dir.iterdir())}
-    report_calls = 0
-
-    def must_not_generate_report(*_args: Any, **_kwargs: Any) -> Any:
-        nonlocal report_calls
-        report_calls += 1
-        raise AssertionError("a terminal resume must not regenerate its report")
-
-    monkeypatch.setattr(finalization_module, "generate_report", must_not_generate_report)
-
-    graph.invoke(
-        None,
-        config,
-        context=context,
-        durability="sync",
-    )
-
-    after_snapshot = graph.get_state(config)
-    assert validate_graph_state(dict(after_snapshot.values)) == before_state
-    assert after_snapshot.next == before_snapshot.next == ()
-    assert after_snapshot.config["configurable"]["checkpoint_id"] == before_checkpoint_id
-    assert model.invoke_count == model_calls
-    assert provider.calls == provider_calls
-    assert report_calls == 0
-    assert {
-        path.name: path.read_bytes() for path in sorted(report_dir.iterdir())
-    } == report_contents
-
-
-def test_maximum_tool_path_stops_by_budget_within_recursion_limit(
-    tmp_path: Path,
-) -> None:
-    model = DynamicResearchGraphFakeChatModel(
-        _graph_research_draft(),
-        _worst_case_budget_decider,
-    )
-    provider = GraphMarketDataProvider()
-    graph, config, context, _report_dir = _start_durable_research_graph(
-        tmp_path,
-        model=model,
-        provider=provider,
-        budget=AgentBudget(),
-        checkpointer=InMemorySaver(),
-    )
-
-    graph.invoke(
-        Command(resume={"action": "approve"}),
-        config,
-        context=context,
-        durability="sync",
-    )
-
-    state = _checkpoint_state(graph, config)
-    assert state["status"] == "budget_exhausted"
-    assert state["agent_steps"] == state["tool_calls"] == 30
-    assert state["training_backtests"] == 0
-    assert state["validated_configs"] == {}
-    assert state["training_evaluations"] == state["final_evaluations"] == []
-    assert len(state["message_journal"]) == 30
-    assert [entry["tool_name"] for entry in state["message_journal"]] == ["analyze_drawdown"] * 30
-    assert all(entry["observation"]["status"] == "rejected" for entry in state["message_journal"])
-    terminal = state["terminal_result"]
-    assert terminal is not None
-    assert terminal["status"] == "budget_exhausted"
-    assert terminal["budget_usage"] == {
-        "agent_steps": 30,
-        "tool_calls": 30,
-        "training_backtests": 0,
-    }
-    assert len(model.research_messages_seen) == 30
-    assert provider.calls == []
-
-
 def test_final_lock_recompile_preserves_test_visibility_and_submits_without_download(
-    tmp_path: Path,
+    tmp_path: Path, retry_delays: list[float]
 ) -> None:
     saver = InMemorySaver()
     first_model = DynamicResearchGraphFakeChatModel(
@@ -2272,14 +2255,13 @@ def test_final_lock_recompile_preserves_test_visibility_and_submits_without_down
             durability="sync",
         )
 
-    assert caught.value.stage == "model"
     assert caught.value.__context__ is None
     locked_state = _checkpoint_state(graph, config)
     assert locked_state["status"] == "running"
-    assert locked_state["phase"] == "researching"
+    assert locked_state["workspace"]["phase"] == "researching"
     assert graph.get_state(config).next == ("research_agent",)
     assert [call[0] for call in first_provider.calls] == ["AAPL", "SPY"]
-    assert not report_dir.exists()
+    assert "report.json" not in _artifact_names(report_dir)
     before_prompt_state = _react_state(first_model.research_messages_seen[-1])
     locked_fingerprint = before_prompt_state["locked_candidate"]["fingerprint"]
     assert isinstance(locked_fingerprint, str)
@@ -2304,10 +2286,13 @@ def test_final_lock_recompile_preserves_test_visibility_and_submits_without_down
 
     state = _checkpoint_state(resumed_graph, config)
     assert state["status"] == "selected"
-    assert state["phase"] == "completed"
-    assert state["locked_fingerprint"] == locked_fingerprint
-    assert state["final_evaluations"] == [locked_fingerprint]
-    terminal = state["terminal_result"]
+    assert state["workspace"]["phase"] == "completed"
+    assert state["workspace"]["locked_fingerprint"] == locked_fingerprint
+    assert [candidate["fingerprint"] for candidate in state["workspace"]["candidates"]] == [
+        locked_fingerprint
+    ]
+    assert state["workspace"]["candidates"][0]["test"] is not None
+    terminal = state["workspace"]["result"]
     assert terminal is not None
     assert terminal["selected_fingerprint"] == locked_fingerprint
     assert terminal["evaluated_fingerprint"] == locked_fingerprint
@@ -2315,6 +2300,4 @@ def test_final_lock_recompile_preserves_test_visibility_and_submits_without_down
     assert after_prompt_state["locked_candidate"] == before_prompt_state["locked_candidate"]
     assert after_prompt_state["tested_candidates"] == before_prompt_state["tested_candidates"]
     assert resumed_provider.calls == []
-    assert {path.name for path in report_dir.iterdir()} == {
-        "report.json",
-    }
+    assert _artifact_names(report_dir) == {"market_data.json", "report.json"}

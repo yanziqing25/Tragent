@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from trading.quant.models import (
+from tragent.quant.models import (
     BacktestCosts,
     DataQualityReport,
     DrawdownAnalysis,
@@ -22,7 +21,7 @@ from trading.quant.models import (
     TrainingEvaluation,
     strategy_name,
 )
-from trading.reporting import (
+from tragent.research.reporting import (
     CriticReviewReport,
     ReportInput,
     build_report_view,
@@ -104,6 +103,7 @@ def segment(
             recovery_date=None,
             underwater_bars=1,
         ),
+        mean_exposure=0.5,
         trades=trades,
         warnings=("Sharpe unavailable." if sharpe_ratio is None else "Synthetic data.",),
     )
@@ -141,7 +141,7 @@ def evaluation(
     )
 
 
-def report_input(tmp_path: Path, **changes: object) -> ReportInput:
+def report_input(**changes: object) -> ReportInput:
     result = evaluation(sharpe_ratio=None)
     values: dict[str, object] = {
         "research_objective": "Test Vue report",
@@ -151,20 +151,19 @@ def report_input(tmp_path: Path, **changes: object) -> ReportInput:
         "selected_fingerprint": "candidate-1",
         "limitations": ("Synthetic and illustrative only.",),
         "runtime_warnings": ("Runtime warning.",),
-        "output_dir": tmp_path,
+        "artifacts": "research/t",
     }
     values.update(changes)
     return ReportInput(**values)
 
 
-def test_generates_one_parseable_vue_report(tmp_path: Path) -> None:
+def test_generates_one_parseable_vue_report(object_store: dict[str, bytes]) -> None:
     first = evaluation()
     selected = evaluation(
         config=MovingAverageConfig(short_window=3, long_window=5),
         open_test_trade=True,
     )
     source = report_input(
-        tmp_path,
         final_evaluations={"first": first, "selected": selected},
         selected_fingerprint="selected",
         critic_reviews=(
@@ -176,23 +175,22 @@ def test_generates_one_parseable_vue_report(tmp_path: Path) -> None:
         critic_review_status="accepted",
     )
 
-    report_path = generate_report(source)
-    report = load_report_view(report_path)
+    report_key = generate_report(source)
+    report = load_report_view(report_key)
 
-    assert report_path == tmp_path / "report.json"
-    assert [path.name for path in tmp_path.iterdir()] == ["report.json"]
+    assert list(object_store) == [report_key] == ["research/t/report.json"]
     assert report == build_report_view(source)
     assert report.selected_candidate_id == "selected"
     assert len(report.references) == 2
     assert len(report.candidates) == 2
     assert report.critic_review_status == "accepted"
     assert report.candidates[1].segments[1].trades[0].action == "buy"
-    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload = json.loads(object_store[report_key])
     assert "figure" not in payload
     assert "chart_config" not in payload
 
 
-def test_minute_report_uses_session_buy_and_hold_without_a_benchmark(tmp_path: Path) -> None:
+def test_minute_report_uses_session_buy_and_hold_without_a_benchmark() -> None:
     result = evaluation()
 
     def minute_segment(value: SegmentBacktestResult) -> SegmentBacktestResult:
@@ -226,7 +224,7 @@ def test_minute_report_uses_session_buy_and_hold_without_a_benchmark(tmp_path: P
             bar_interval="1m",
             final_evaluations={"minute": minute},
             selected_fingerprint="minute",
-            output_dir=tmp_path,
+            artifacts="research/t",
         )
     )
 
@@ -236,14 +234,11 @@ def test_minute_report_uses_session_buy_and_hold_without_a_benchmark(tmp_path: P
     assert all(reference.benchmark_equity is None for reference in report.references)
 
 
-def test_no_selection_requires_a_stop_reason(
-    tmp_path: Path,
-) -> None:
+def test_no_selection_requires_a_stop_reason() -> None:
     with pytest.raises(ValueError, match="stop_reason"):
-        generate_report(report_input(tmp_path, selected_fingerprint=None, stop_reason=None))
+        generate_report(report_input(selected_fingerprint=None, stop_reason=None))
 
     source = report_input(
-        tmp_path,
         selected_fingerprint=None,
         stop_reason="No strategy met the drawdown constraint.",
     )
@@ -253,10 +248,9 @@ def test_no_selection_requires_a_stop_reason(
     assert report.candidates[0].id == "candidate-1"
 
 
-def test_failure_and_training_only_reports_keep_available_evidence(tmp_path: Path) -> None:
+def test_failure_and_training_only_reports_keep_available_evidence() -> None:
     failure = build_report_view(
         report_input(
-            tmp_path,
             final_evaluations={},
             selected_fingerprint=None,
             stop_reason="Market data was unavailable.",
@@ -285,7 +279,6 @@ def test_failure_and_training_only_reports_keep_available_evidence(tmp_path: Pat
     )
     report = build_report_view(
         report_input(
-            tmp_path,
             final_evaluations={},
             training_evaluations={"training": training},
             selected_fingerprint=None,
@@ -298,11 +291,10 @@ def test_failure_and_training_only_reports_keep_available_evidence(tmp_path: Pat
     assert [segment.segment for segment in report.candidates[0].segments] == ["training"]
 
 
-def test_selected_fingerprint_must_be_a_final_candidate(tmp_path: Path) -> None:
+def test_selected_fingerprint_must_be_a_final_candidate() -> None:
     with pytest.raises(ValueError, match="selected_fingerprint"):
         generate_report(
             report_input(
-                tmp_path,
                 selected_fingerprint="unknown",
             )
         )

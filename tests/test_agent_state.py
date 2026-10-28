@@ -1,4 +1,4 @@
-"""Plain-JSON checkpoint State, journal, and terminal-result adapter tests."""
+"""Plain-JSON checkpoint State, workspace journal, and market-data snapshot tests."""
 
 from __future__ import annotations
 
@@ -8,27 +8,27 @@ import sys
 import textwrap
 from datetime import date
 from pathlib import Path
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pandas as pd
 import pytest
 
-from trading.agent.models import (
+from tragent.quant import AlignedMarketData, DataQualityReport, MarketData
+from tragent.research.agent.market_snapshot import load_market_data, save_market_data
+from tragent.research.agent.models import (
     AgentBudget,
     GoalDraft,
     ResearchGoal,
     ToolObservation,
 )
-from trading.agent.prompt import build_research_messages
-from trading.agent.state import (
-    GraphState,
-    aligned_data_to_snapshot,
-    restore_workspace_from_state,
-    validate_graph_state,
-    workspace_to_state,
+from tragent.research.agent.prompt import research_system_prompt
+from tragent.research.agent.state import validate_graph_state
+from tragent.research.agent.workspace import (
+    ResearchGraphContext,
+    ResearchWorkspace,
+    record_tool_call,
 )
-from trading.agent.workspace import ResearchWorkspace, record_event
-from trading.quant import AlignedMarketData, DataQualityReport, MarketData
 
 
 class NeverProvider:
@@ -37,7 +37,7 @@ class NeverProvider:
 
     def get_daily_bars(self, *_args: object, **_kwargs: object) -> object:
         self.calls += 1
-        raise AssertionError("State adapter tests must not access market data")
+        raise AssertionError("State tests must not access market data")
 
 
 def _goal() -> ResearchGoal:
@@ -117,77 +117,20 @@ def _aligned_data() -> AlignedMarketData:
     )
 
 
-def _state(*, status: str = "awaiting_confirmation") -> GraphState:
-    goal = _goal().model_dump(mode="json")
-    draft = _draft()
-    confirmed = status not in {"awaiting_confirmation", "rejected"}
-    terminal = None
-    phase = "researching" if status == "running" else None
-    if status in {"selected", "no_strategy", "failed", "budget_exhausted"}:
-        phase = "completed"
-        terminal = {
-            "status": status,
-            "selected_fingerprint": None,
-            "evaluated_fingerprint": None,
-            "training_metrics": {},
-            "test_metrics": {},
-            "conclusion": "The research run stopped safely without selecting a strategy.",
-            "stop_reason": "The research run stopped safely.",
-            "warnings": [],
-            "limitations": [],
-            "budget_usage": {
-                "agent_steps": 0,
-                "tool_calls": 0,
-                "training_backtests": 0,
-            },
-        }
+def _state(*, workspace: ResearchWorkspace | None = None) -> dict[str, object]:
     return {
         "thread_id": str(uuid4()),
         "user_id": 1,
         "request": _goal().objective,
         "reference_date": "2026-07-13",
-        "status": status,
-        "failure_stage": None,
-        "confirmation_error": None,
-        "failure_summary": None,
-        "cost_defaults": {
-            "transaction_cost_bps": 5.0,
-            "slippage_bps": 5.0,
-        },
+        "status": "awaiting_confirmation" if workspace is None else "running",
+        "cost_defaults": {"transaction_cost_bps": 5.0, "slippage_bps": 5.0},
         "position_tranches_default": 5,
-        "draft_goal": draft if status == "awaiting_confirmation" else None,
-        "confirmed_goal": goal if confirmed else None,
-        "missing_goal_fields": [],
-        "defaulted_fields": ["start_date", "end_date"],
         "budget": AgentBudget().model_dump(mode="json"),
-        "phase": phase,
-        "active_agent": "research" if status == "running" else None,
-        "critic_rounds": [],
-        "agent_steps": 0,
-        "tool_calls": 0,
-        "training_backtests": 0,
-        "download_failures": 0,
-        "message_journal": [],
-        "unresolved_issues": [],
-        "runtime_warnings": [],
-        "fatal_reason": None,
-        "data_snapshot": None,
-        "current_candidate": None,
-        "validated_configs": {},
-        "training_evaluations": [],
-        "final_evaluations": [],
-        "locked_fingerprint": None,
-        "final_batch_completed": False,
-        "terminal_result": terminal,
+        "draft_goal": _draft() if workspace is None else None,
+        "defaulted_fields": ["start_date", "end_date"],
+        "workspace": None if workspace is None else workspace.model_dump(mode="json"),
     }
-
-
-def _report_dir(tmp_path: Path) -> Path:
-    report_dir = tmp_path / str(uuid4())
-    report_dir.mkdir()
-    for name in ("report.json",):
-        (report_dir / name).write_text("test", encoding="utf-8")
-    return report_dir
 
 
 def test_graph_state_round_trips_with_strict_msgpack_as_plain_json() -> None:
@@ -198,8 +141,9 @@ def test_graph_state_round_trips_with_strict_msgpack_as_plain_json() -> None:
         from langgraph.checkpoint.memory import InMemorySaver
         from langgraph.graph import END, START, StateGraph
 
-        from trading.agent.models import AgentBudget, GoalDraft, ResearchGoal
-        from trading.agent.state import GraphState, validate_graph_state
+        from tragent.research.agent.models import AgentBudget, ResearchGoal
+        from tragent.research.agent.state import GraphState, validate_graph_state
+        from tragent.research.agent.workspace import ResearchWorkspace
 
         goal = ResearchGoal(
             objective="Compare transparent long-only strategies.",
@@ -208,80 +152,40 @@ def test_graph_state_round_trips_with_strict_msgpack_as_plain_json() -> None:
             end_date="2024-01-30",
             allowed_strategies=("moving_average", "rsi", "macd"),
             max_drawdown_limit=0.2,
-        ).model_dump(mode="json")
-        draft = GoalDraft(
-            symbol=goal["symbol"],
-            bar_interval=goal["bar_interval"],
-            start_date=goal["start_date"],
-            end_date=goal["end_date"],
-            allowed_strategies=goal["allowed_strategies"],
-            max_drawdown_limit=goal["max_drawdown_limit"],
-            position_tranches=goal["position_tranches"],
-            transaction_cost_bps=goal["costs"]["transaction_cost_bps"],
-            slippage_bps=goal["costs"]["slippage_bps"],
-            benchmark_symbol=goal["benchmark_symbol"],
-        ).model_dump(mode="json")
-        state = {
-            "thread_id": str(uuid4()),
-            "user_id": 1,
-            "request": "Compare transparent long-only strategies.",
-            "reference_date": "2026-07-13",
-            "status": "awaiting_confirmation",
-            "failure_stage": None,
-            "confirmation_error": None,
-            "failure_summary": None,
-            "cost_defaults": {"transaction_cost_bps": 5.0, "slippage_bps": 5.0},
-            "position_tranches_default": 5,
-            "draft_goal": draft,
-            "confirmed_goal": None,
-            "missing_goal_fields": [],
-            "defaulted_fields": ["start_date", "end_date"],
-            "budget": AgentBudget().model_dump(mode="json"),
-            "phase": None,
-            "active_agent": None,
-            "critic_rounds": [],
-            "agent_steps": 0,
-            "tool_calls": 0,
-            "training_backtests": 0,
-            "download_failures": 0,
-            "message_journal": [],
-            "unresolved_issues": [],
-            "runtime_warnings": [],
-            "fatal_reason": None,
-            "data_snapshot": None,
-            "current_candidate": None,
-            "validated_configs": {},
-            "training_evaluations": [],
-            "final_evaluations": [],
-            "locked_fingerprint": None,
-            "final_batch_completed": False,
-            "terminal_result": None,
-        }
-        state = validate_graph_state(state)
+        )
+        state = validate_graph_state(
+            {
+                "thread_id": str(uuid4()),
+                "user_id": 1,
+                "request": "Compare transparent long-only strategies.",
+                "reference_date": "2026-07-13",
+                "status": "running",
+                "cost_defaults": {"transaction_cost_bps": 5.0, "slippage_bps": 5.0},
+                "position_tranches_default": 5,
+                "budget": AgentBudget().model_dump(mode="json"),
+                "workspace": ResearchWorkspace(goal=goal, budget=AgentBudget()).model_dump(
+                    mode="json"
+                ),
+            }
+        )
         builder = StateGraph(GraphState)
-        builder.add_node("validate", validate_graph_state)
+        builder.add_node(
+            "validate",
+            lambda current: validate_graph_state(current).model_dump(mode="json"),
+        )
         builder.add_edge(START, "validate")
         builder.add_edge("validate", END)
         graph = builder.compile(checkpointer=InMemorySaver())
-        config = {"configurable": {"thread_id": state["thread_id"]}}
-        output = graph.invoke(state, config, durability="sync")
-        snapshot = graph.get_state(config)
-        assert output == state
-        assert snapshot.values == state
-
-        invalid = dict(state)
-        invalid["data_snapshot"] = {"huge_integer": 2**64}
-        try:
-            validate_graph_state(invalid)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("strict-msgpack-incompatible integer was accepted")
+        config = {"configurable": {"thread_id": state.thread_id}}
+        expected = state.model_dump(mode="json")
+        assert graph.invoke(expected, config, durability="sync") == expected
+        assert graph.get_state(config).values == expected
         """
     )
     environment = dict(os.environ)
     environment["LANGGRAPH_STRICT_MSGPACK"] = "true"
     environment["LANGSMITH_TRACING"] = "false"
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
 
     completed = subprocess.run(
         [sys.executable, "-c", script],
@@ -300,82 +204,54 @@ def test_validate_graph_state_returns_detached_plain_json() -> None:
     validated = validate_graph_state(source)
     source["defaulted_fields"].append("benchmark_symbol")
 
-    assert validated["defaulted_fields"] == ["start_date", "end_date"]
+    assert validated.defaulted_fields == ("start_date", "end_date")
 
 
 def test_missing_required_state_field_is_not_silently_defaulted() -> None:
     state = _state()
-    state.pop("agent_steps")
+    state.pop("budget")
 
     with pytest.raises(ValueError, match="Graph State failed validation"):
         validate_graph_state(state)
 
 
-def test_journal_round_trip_restores_events_trace_and_prompt(tmp_path: Path) -> None:
-    report_dir = _report_dir(tmp_path)
-    workspace = ResearchWorkspace(
-        goal=_goal(),
-        budget=AgentBudget(),
-        provider=NeverProvider(),
-        output_dir=report_dir,
+def test_journal_round_trip_rebuilds_the_identical_model_context() -> None:
+    context = ResearchGraphContext(
+        model=MagicMock(), provider=NeverProvider(), artifacts="research/t"
     )
-    workspace.agent_steps = 1
+    workspace = ResearchWorkspace(goal=_goal(), budget=AgentBudget(), agent_steps=1).bind(context)
     observation = ToolObservation(
         tool_name="submit_research_draft",
         status="success",
         summary="The frozen draft was submitted for Critic review.",
     )
-    record_event(
-        workspace,
+    record_tool_call(
+        workspace.journal,
+        step=1,
         tool_name="submit_research_draft",
-        normalized_arguments={"outcome": "no_strategy"},
+        arguments={"outcome": "no_strategy"},
         observation=observation,
-        tool_call_id="call-1",
-        replayable=True,
-    )
-    original_messages = build_research_messages(workspace)
-
-    state = _state(status="running")
-    state.update(workspace_to_state(workspace))
-    _, rebuilt = restore_workspace_from_state(
-        validate_graph_state(state),
-        provider=NeverProvider(),
-        output_dir=report_dir,
     )
 
-    assert rebuilt.events[0].observation == observation
-    assert rebuilt.trace == workspace.trace
-    assert build_research_messages(rebuilt) == original_messages
+    rebuilt = validate_graph_state(_state(workspace=workspace)).workspace
+
+    assert rebuilt is not None
+    assert rebuilt.journal == workspace.journal
+    assert research_system_prompt(rebuilt) == research_system_prompt(workspace)
 
 
-def test_snapshot_round_trip_rebuilds_workspace_without_provider_or_counter_side_effects(
-    tmp_path: Path,
-) -> None:
-    state = _state(status="running")
+def test_market_data_snapshot_round_trips_without_provider_access() -> None:
     original = _aligned_data()
-    state["data_snapshot"] = aligned_data_to_snapshot(original)
-    provider = NeverProvider()
-    output_dir = tmp_path / "not-created-by-rehydrate"
 
-    _, rebuilt = restore_workspace_from_state(state, provider=provider, output_dir=output_dir)
+    save_market_data("research/t", original)
+    rebuilt = load_market_data("research/t")
 
-    assert rebuilt.aligned_data is not None
-    pd.testing.assert_frame_equal(
-        rebuilt.aligned_data.asset.bars,
-        original.asset.bars,
-        check_freq=False,
-        check_names=False,
-    )
-    pd.testing.assert_frame_equal(
-        rebuilt.aligned_data.benchmark.bars,
-        original.benchmark.bars,
-        check_freq=False,
-        check_names=False,
-    )
-    assert rebuilt.aligned_data.asset.quality == original.asset.quality
-    assert rebuilt.aligned_data.benchmark.quality == original.benchmark.quality
-    assert rebuilt.aligned_data.warnings == original.warnings
-    assert provider.calls == 0
-    assert rebuilt.agent_steps == rebuilt.tool_calls == rebuilt.training_backtests == 0
-    assert rebuilt.events == rebuilt.trace == []
-    assert output_dir.exists() is False
+    for name in ("asset", "benchmark"):
+        pd.testing.assert_frame_equal(
+            getattr(rebuilt, name).bars,
+            getattr(original, name).bars,
+            check_freq=False,
+            check_names=False,
+        )
+        assert getattr(rebuilt, name).quality == getattr(original, name).quality
+    assert rebuilt.warnings == original.warnings

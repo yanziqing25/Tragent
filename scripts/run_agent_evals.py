@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from datetime import date
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -17,14 +17,17 @@ from agent_eval_cases import (
 )
 from langsmith import Client
 
-from trading.checkpoint import DatabasePool, build_connection_pool, setup_persistence
-from trading.config import ConfigurationError, Settings, load_settings
-from trading.llm import build_llm
-from trading.research import ResearchTaskView, stream_resume_research, stream_start_research
+from tragent import redis_client
+from tragent.config import ConfigurationError, Settings, load_settings
+from tragent.db import DatabasePool, build_connection_pool
+from tragent.research.llm import build_llm
+from tragent.research.persistence import setup_persistence
+from tragent.research.service import ResearchTaskView, resume_research, run_research, start_research
 
 DATASET_NAME = "trading-v2-agent-decisions-v2"
 EXPERIMENT_PREFIX = "trading-v2-agent-decisions"
 _EXAMPLE_NAMESPACE = uuid5(NAMESPACE_URL, DATASET_NAME)
+_SMOKE_USER_ID = 1
 
 
 class EvalError(RuntimeError):
@@ -41,9 +44,7 @@ def _sync_dataset(client: Client, cases: Mapping[str, AgentEvalCase]) -> None:
     else:
         dataset = client.create_dataset(
             DATASET_NAME,
-            description=(
-                "Eight real-model Research/Critic decision cases for Tragent."
-            ),
+            description=("Eight real-model Research/Critic decision cases for Tragent."),
             metadata={"owner": "tragent", "contract_version": 2},
         )
 
@@ -123,6 +124,14 @@ def _policy_evaluator(
     if isinstance(allowed_verdicts, list) and allowed_verdicts:
         results.append(
             {"key": "verdict_policy", "score": outputs.get("verdict") in allowed_verdicts}
+        )
+        results.append(
+            {
+                "key": "evidence_review",
+                "score": "inspect_retrieved_context" in names
+                and "submit_critic_review" in names
+                and names.index("inspect_retrieved_context") < names.index("submit_critic_review"),
+            }
         )
 
     if reference_outputs.get("require_training_backtest") is True:
@@ -210,40 +219,47 @@ def _validate_smoke(view: ResearchTaskView) -> None:
         raise EvalError("The full smoke did not generate its report.")
 
 
-def _task_view(items: Iterable[object]) -> ResearchTaskView:
-    views = [item for item in items if isinstance(item, ResearchTaskView)]
-    if len(views) != 1:
-        raise EvalError("The Agent stream did not return one task view.")
-    return views[0]
-
-
 def _run_smoke(settings: Settings, pool: DatabasePool) -> None:
     request = (
         "研究 AAPL 从 2024-01-01 到 2024-06-30 的日线，在 40% 最大回撤约束下比较 RSI，"
         "并与 SPY 进行比较；手续费 5 bps，滑点 5 bps"
     )
-    started = _task_view(
-        stream_start_research(
-            request,
-            settings=settings,
-            pool=pool,
-            reference_date=date(2024, 6, 30),
+    redis = redis_client.connect(settings)
+
+    def run_inline(thread_id: str, user_id: int, resume: dict[str, str] | None) -> None:
+        """Run each queued step in this process instead of a Celery worker."""
+
+        run_research(
+            thread_id, user_id=user_id, resume=resume, settings=settings, pool=pool, redis=redis
         )
+
+    started = start_research(
+        request,
+        user_id=_SMOKE_USER_ID,
+        settings=settings,
+        pool=pool,
+        redis=redis,
+        enqueue=run_inline,
+        reference_date=date(2024, 6, 30),
     )
     print(f"Full smoke thread: {started.thread_id}")
     if started.status != "awaiting_confirmation":
         raise EvalError("The full smoke did not stop at the expected HITL confirmation.")
-    completed = _task_view(
-        stream_resume_research(
-            started.thread_id,
-            settings=settings,
-            pool=pool,
-            action="approve",
-        )
+    completed = resume_research(
+        started.thread_id,
+        user_id=_SMOKE_USER_ID,
+        pool=pool,
+        redis=redis,
+        enqueue=run_inline,
+        action="approve",
     )
     if completed.status == "running" and completed.can_resume:
-        completed = _task_view(
-            stream_resume_research(started.thread_id, settings=settings, pool=pool)
+        completed = resume_research(
+            started.thread_id,
+            user_id=_SMOKE_USER_ID,
+            pool=pool,
+            redis=redis,
+            enqueue=run_inline,
         )
     _validate_smoke(completed)
     print(f"Full smoke: {completed.thread_id} -> {completed.status} ({completed.critic_verdict}).")
@@ -275,19 +291,13 @@ def main() -> int:
         if args.with_smoke:
             with build_connection_pool(settings) as pool:
                 pool.wait(timeout=settings.postgres_pool_timeout_seconds)
-                setup_persistence(pool)
+                setup_persistence(pool, settings)
                 _run_smoke(settings, pool)
     except ConfigurationError as error:
         print(str(error))
         return 1
     except (CaseContractError, EvalError) as error:
         print(f"Agent Eval stopped safely: {error}")
-        return 1
-    except Exception as error:
-        print(
-            "Agent Eval failed safely because an external or integration check failed "
-            f"({type(error).__name__})."
-        )
         return 1
     return 0
 

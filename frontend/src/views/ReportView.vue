@@ -1,419 +1,579 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { ToggleGroupItem, ToggleGroupRoot } from 'reka-ui'
+import { ArrowLeft, Check, CircleAlert, Minus } from '@lucide/vue'
 
-import { getResearchReport } from '@/api/api'
-import ReportChart from '@/components/ReportChart.vue'
-import TradeDetails from '@/components/TradeDetails.vue'
-import type { PerformanceMetrics, ReportCandidate, ResearchReportView } from '@/api/generated'
-import { candidateLabel, defaultReportCandidateId } from '@/components/reportFigure'
-import { useAuthStore } from '@/stores/auth'
+import type { ReportCandidate } from '@/api/types'
+import CandidateTable from '@/components/report/CandidateTable.vue'
+import SegmentChart from '@/components/report/SegmentChart.vue'
+import TradeLedger from '@/components/report/TradeLedger.vue'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
+import { errorMessage } from '@/lib/errors'
+import { candidateLabel, formatNumber, formatPercent, minuteTimestamp } from '@/lib/formatters'
+import {
+  candidateColors,
+  candidateSegment,
+  defaultCandidateId,
+  orderedCandidates,
+} from '@/lib/report'
+import {
+  assetName,
+  buildSegmentOption,
+  CHART_PALETTE,
+  tagsVisible,
+  type ChartMetric,
+  type ChartState,
+} from '@/lib/reportChart'
+import { CRITIC_VERDICT, criticReviewLabel } from '@/lib/status'
+import { useTheme } from '@/lib/theme'
+import { useReport } from '@/queries/research'
+import DeployStrategy from '@/components/trading/DeployStrategy.vue'
 
-const auth = useAuthStore()
+const SOURCE_LABELS = { official: 'Official', news: 'News', community: 'Community' } as const
+
 const route = useRoute()
-const threadId = String(route.params.threadId)
-const report = ref<ResearchReportView | null>(null)
-const error = ref<string | null>(null)
-const loading = ref(true)
-const tradeDetails = ref<InstanceType<typeof TradeDetails> | null>(null)
-const controller = new AbortController()
+const threadId = computed(() => String(route.params.threadId))
+const query = useReport(threadId)
+const report = computed(() => query.data.value)
+// Only a daily strategy the Critic accepted can trade the paper account.
+const deployable = computed(
+  () =>
+    report.value?.critic_review_status === 'accepted' &&
+    report.value.selected_candidate_id !== null &&
+    report.value.bar_interval === '1d',
+)
+const { isDark } = useTheme()
 
-const metricColumns = [
-  ['total_return', 'Total return'],
-  ['annualized_return', 'Annualized return'],
-  ['annualized_volatility', 'Annualized volatility'],
-  ['sharpe_ratio', 'Sharpe ratio'],
-  ['max_drawdown', 'Max drawdown'],
-  ['trade_count', 'Trade count'],
-  ['turnover', 'Turnover'],
-  ['asset_buy_and_hold_return', 'Asset buy-and-hold return'],
-  ['benchmark_return', 'Benchmark buy-and-hold return'],
-] as const satisfies ReadonlyArray<readonly [keyof PerformanceMetrics, string]>
+const candidates = computed(() => (report.value ? orderedCandidates(report.value) : []))
+const colors = computed(() =>
+  report.value ? candidateColors(report.value, isDark.value) : new Map<string, string>(),
+)
+const palette = computed(() => CHART_PALETTE[isDark.value ? 'dark' : 'light'])
 
-type MetricRow = {
-  candidate: ReportCandidate
-  segment: 'training' | 'test'
-  metrics: PerformanceMetrics | null
+// The legend and the trade ledger share one selection.
+const visible = ref<string[]>([])
+const showAsset = ref(true)
+const showBenchmark = ref(true)
+const metric = ref<ChartMetric>('equity')
+const openId = ref<string | null>(null)
+
+watch(
+  () => report.value?.selected_candidate_id,
+  () => {
+    if (!report.value) return
+    const initial = defaultCandidateId(report.value)
+    visible.value = initial ? [initial] : []
+    openId.value = initial
+  },
+  { immediate: true },
+)
+
+const toggleCandidate = (id: string) => {
+  if (!visible.value.includes(id)) {
+    visible.value = [...visible.value, id]
+    openId.value = id
+    return
+  }
+  const rest = visible.value.filter((item) => item !== id)
+  visible.value = rest
+  if (openId.value === id) openId.value = rest[rest.length - 1] ?? null
 }
 
-const selectedCandidate = computed(() =>
-  report.value?.candidates.find((candidate) => candidate.id === report.value?.selected_candidate_id),
+/** Opening a ledger shows that strategy alone, like picking it in the legend. */
+const toggleLedger = (id: string) => {
+  if (openId.value === id) {
+    openId.value = null
+    return
+  }
+  openId.value = id
+  visible.value = [id]
+}
+
+const state = computed<ChartState>(() => ({
+  visible: visible.value,
+  showAsset: showAsset.value,
+  showBenchmark: showBenchmark.value,
+  metric: metric.value,
+}))
+
+const primary = computed<ReportCandidate | undefined>(() =>
+  candidates.value.find((candidate) => candidate.id === defaultCandidateId(report.value!)),
 )
-const defaultCandidateId = computed(() =>
-  report.value ? defaultReportCandidateId(report.value) : null,
+const primaryTest = computed(() => primary.value && candidateSegment(primary.value, 'test'))
+const headline = computed(
+  () => primaryTest.value ?? (primary.value && candidateSegment(primary.value, 'training')),
 )
-const hasFinalEvaluation = computed(() =>
-  report.value?.candidates.some((candidate) =>
-    candidate.segments.some((segment) => segment.segment === 'test'),
-  ) ?? false,
-)
-const metricRows = computed<MetricRow[]>(() =>
-  (report.value?.candidates ?? []).flatMap((candidate) => {
-    const rows: MetricRow[] = candidate.segments.map((segment) => ({
-      candidate,
-      segment: segment.segment,
-      metrics: segment.metrics,
-    }))
-    if (!candidate.segments.some((segment) => segment.segment === 'test')) {
-      rows.push({ candidate, segment: 'test', metrics: null })
+
+const stats = computed(() => {
+  const segment = headline.value
+  if (!segment) return []
+  const m = segment.metrics
+  return [
+    { label: 'Return', value: formatPercent(m.total_return, { signed: true }) },
+    { label: 'Sharpe', value: formatNumber(m.sharpe_ratio) },
+    { label: 'Max drawdown', value: formatPercent(m.max_drawdown) },
+    { label: 'Trades', value: String(m.trade_count) },
+    { label: 'Exposure', value: formatPercent(segment.mean_exposure, { digits: 1 }) },
+  ]
+})
+
+const comparison = computed(() => {
+  const segment = primaryTest.value
+  if (!segment || !report.value || !primary.value) return []
+  const m = segment.metrics
+  const rows = [
+    {
+      label: candidateLabel(primary.value),
+      value: m.total_return,
+      color: colors.value.get(primary.value.id)!,
+    },
+    {
+      label: assetName(report.value),
+      value: m.asset_buy_and_hold_return,
+      color: palette.value.asset,
+    },
+  ]
+  if (m.benchmark_return !== null && report.value.benchmark_symbol) {
+    rows.push({
+      label: report.value.benchmark_symbol,
+      value: m.benchmark_return,
+      color: palette.value.benchmark,
+    })
+  }
+  const largest = Math.max(...rows.map((row) => Math.abs(row.value)), 1e-9)
+  return rows.map((row, index) => ({
+    ...row,
+    text: formatPercent(row.value, { signed: true }),
+    width: `${(Math.abs(row.value) / largest) * 100}%`,
+    delay: `${200 + index * 100}ms`,
+  }))
+})
+
+const verdict = computed(() => {
+  const value = report.value
+  if (!value) return null
+  const selected = candidates.value.find(
+    (candidate) => candidate.id === value.selected_candidate_id,
+  )
+  const critic = criticReviewLabel(value.critic_review_status)
+  if (!selected) {
+    return {
+      tone: value.critic_review_status === 'rejected' ? 'danger' : 'neutral',
+      title: `No strategy selected · ${critic}`,
+      body: value.stop_reason,
     }
-    return rows
-  }),
+  }
+  const m = primaryTest.value?.metrics
+  const points = (a: number, b: number) => `${formatNumber(Math.abs(a - b) * 100)} points`
+  const parts: string[] = []
+  if (m && m.benchmark_return !== null && value.benchmark_symbol) {
+    parts.push(
+      `${m.total_return >= m.benchmark_return ? 'Beat' : 'Trailed'} ${value.benchmark_symbol} by ${points(m.total_return, m.benchmark_return)}`,
+    )
+  }
+  if (m) {
+    const verb = m.total_return >= m.asset_buy_and_hold_return ? 'beat' : 'trailed'
+    parts.push(
+      `${parts.length ? verb : verb[0].toUpperCase() + verb.slice(1)} holding ${value.symbol} by ${points(m.total_return, m.asset_buy_and_hold_return)}`,
+    )
+  }
+  const exposure = primaryTest.value
+    ? `, with ${formatPercent(primaryTest.value.mean_exposure, { digits: 0 })} average exposure`
+    : ''
+  return {
+    tone: 'success',
+    title: `Selected ${candidateLabel(selected)} · ${critic}`,
+    body: parts.length ? `${parts.join(' and ')} out of sample${exposure}.` : '',
+  }
+})
+
+const legend = computed(() => {
+  const value = report.value
+  if (!value) return []
+  const strategies = candidates.value.map((candidate) => ({
+    key: candidate.id,
+    label: candidateLabel(candidate),
+    color: colors.value.get(candidate.id)!,
+    dashed: false,
+    pressed: visible.value.includes(candidate.id),
+    toggle: () => toggleCandidate(candidate.id),
+  }))
+  const references = [
+    {
+      key: 'asset',
+      label: assetName(value),
+      color: palette.value.asset,
+      dashed: false,
+      pressed: showAsset.value,
+      toggle: () => (showAsset.value = !showAsset.value),
+    },
+  ]
+  if (value.benchmark_symbol) {
+    references.push({
+      key: 'benchmark',
+      label: value.benchmark_symbol,
+      color: palette.value.benchmark,
+      dashed: true,
+      pressed: showBenchmark.value,
+      toggle: () => (showBenchmark.value = !showBenchmark.value),
+    })
+  }
+  return [...strategies, ...references]
+})
+
+const segments = computed(() => {
+  const value = report.value
+  if (!value) return []
+  const single =
+    visible.value.length === 1
+      ? candidates.value.find((candidate) => candidate.id === visible.value[0])
+      : undefined
+  return (['training', 'test'] as const).flatMap((segment) => {
+    const option = buildSegmentOption(value, segment, state.value, colors.value, palette.value)
+    const reference = value.references.find((item) => item.segment === segment)
+    if (!option || !reference) return []
+    const metrics = single && candidateSegment(single, segment)?.metrics
+    const summary = metrics
+      ? [
+          `Strategy ${formatPercent(metrics.total_return, { signed: true })}`,
+          `${value.symbol} ${formatPercent(metrics.asset_buy_and_hold_return, { signed: true })}`,
+          ...(metrics.benchmark_return !== null && value.benchmark_symbol
+            ? [
+                `${value.benchmark_symbol} ${formatPercent(metrics.benchmark_return, { signed: true })}`,
+              ]
+            : []),
+        ].join(' · ')
+      : `${visible.value.length} strategies`
+    return [
+      {
+        key: segment,
+        title: segment === 'training' ? 'In-sample' : 'Out-of-sample',
+        option,
+        summary,
+      },
+    ]
+  })
+})
+
+const hint = computed(() =>
+  tagsVisible(state.value)
+    ? `B and S tags mark this strategy’s trades on the ${report.value?.symbol} price line. Hover for details.`
+    : `B and S tags appear with one strategy and ${report.value ? assetName(report.value) : 'buy and hold'} shown.`,
 )
-const benchmarkLabel = computed(() => {
-  if (report.value?.bar_interval === '1m') return 'Session Buy and Hold'
-  return report.value?.benchmark_symbol ?? 'No benchmark'
+
+const dataLine = computed(() => {
+  const value = report.value
+  if (!value?.data_start || !value.data_end) return ''
+  const daily = value.bar_interval === '1d'
+  const range = daily
+    ? `${value.data_start.slice(0, 10)} → ${value.data_end.slice(0, 10)}`
+    : `${minuteTimestamp(value.data_start)} → ${minuteTimestamp(value.data_end)} ET`
+  return [
+    daily ? 'Daily adjusted bars' : '1-minute regular-session bars',
+    range,
+    value.benchmark_symbol && `benchmark ${value.benchmark_symbol}`,
+    'yfinance',
+  ]
+    .filter(Boolean)
+    .join(' · ')
 })
-const dataRange = computed(() => {
-  if (!report.value?.data_start || !report.value.data_end) return 'N/A'
-  if (report.value.bar_interval === '1d') {
-    return `${report.value.data_start.slice(0, 10)} to ${report.value.data_end.slice(0, 10)}`
-  }
-  return `${minuteTimestamp(report.value.data_start)} to ${minuteTimestamp(report.value.data_end)} US/Eastern`
-})
-const dataSourceLabel = computed(() =>
-  report.value?.bar_interval === '1m'
-    ? 'yfinance adjusted 1-minute regular-session bars'
-    : 'yfinance adjusted daily bars',
-)
-const criticFinalVerdict = computed(() => {
-  if (report.value?.critic_review_status === 'accepted') return 'ACCEPT'
-  if (report.value?.critic_review_status === 'rejected') return 'REJECT'
-  return 'N/A — Critic review did not finish.'
-})
-
-onMounted(async () => {
-  try {
-    report.value = await getResearchReport(threadId, controller.signal)
-  } catch (cause) {
-    if (!(cause instanceof DOMException && cause.name === 'AbortError')) {
-      if (!auth.handleUnauthorized(cause)) {
-        error.value = cause instanceof Error ? cause.message : 'Report loading failed.'
-      }
-    }
-  } finally {
-    loading.value = false
-  }
-})
-
-onUnmounted(() => controller.abort())
-
-const focusTradeDetails = (candidateKey: string) => {
-  tradeDetails.value?.focusCandidate(candidateKey)
-}
-
-const parameters = (value: Record<string, number>): string => {
-  return Object.entries(value)
-    .map(([name, parameter]) => `${name}=${parameter}`)
-    .join(', ')
-}
-
-const costs = (transactionCost: number, slippage: number): string => {
-  return `${transactionCost} + ${slippage} bps`
-}
-
-const metric = (name: string, value: number | null | undefined): string => {
-  if (value == null) return 'N/A'
-  if (name === 'trade_count') return String(Math.trunc(value))
-  if (
-    [
-      'total_return',
-      'annualized_return',
-      'annualized_volatility',
-      'max_drawdown',
-      'asset_buy_and_hold_return',
-      'benchmark_return',
-    ].includes(name)
-  ) {
-    return `${(value * 100).toFixed(2)}%`
-  }
-  return value.toFixed(4)
-}
-
-const segmentLabel = (segment: 'training' | 'test'): string => {
-  return segment === 'training' ? 'In-sample backtest' : 'Out-of-sample validation'
-}
-
-const minuteTimestamp = (value: string): string => {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'America/New_York',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-  }).format(new Date(value)).replace(',', '')
-}
-
 </script>
 
 <template>
-  <v-container class="page-shell report-page" max-width="1440">
-    <v-btn
-      class="mb-7"
-      variant="text"
-      :to="{ name: 'research-detail', params: { threadId } }"
-    >
-      ← Back to task
-    </v-btn>
+  <main class="mx-auto flex max-w-(--container-app) flex-col gap-10 px-6 pt-8 pb-20">
+    <Alert v-if="query.error.value" variant="destructive">
+      <CircleAlert />
+      <AlertDescription>{{ errorMessage(query.error.value) }}</AlertDescription>
+    </Alert>
+    <p v-else-if="!report" class="text-muted-foreground">Loading report…</p>
 
-    <v-progress-linear v-if="loading" color="primary" indeterminate rounded />
-    <v-alert v-else-if="error" type="error" variant="tonal">{{ error }}</v-alert>
+    <template v-if="report">
+      <section class="flex animate-rise flex-col gap-3">
+        <RouterLink
+          :to="{ name: 'task', params: { threadId } }"
+          class="inline-flex w-fit items-center gap-1.5 text-[13px] text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft class="size-3.5" /> Task
+        </RouterLink>
+        <h1 class="text-3xl font-semibold tracking-tight">{{ report.symbol }} strategy research</h1>
+        <p class="max-w-190 text-zinc-700 dark:text-zinc-300">{{ report.research_objective }}</p>
+        <p class="text-[13px] text-faint">{{ dataLine }}</p>
+      </section>
 
-    <template v-else-if="report">
-      <v-card class="report-hero mb-7">
-        <v-card-text class="pa-6 pa-sm-8">
-          <div class="page-eyebrow mb-3">Agentic US Equity Research</div>
-          <h1 class="report-title mb-3">{{ report.symbol }} Research Report</h1>
-          <p class="page-copy mb-5">{{ report.research_objective }}</p>
-          <v-chip
-            :color="selectedCandidate ? 'success' : 'warning'"
-            size="large"
-            variant="tonal"
+      <section
+        v-if="verdict"
+        class="flex animate-rise flex-wrap gap-5 rounded-xl p-5 [animation-delay:60ms]"
+        :class="{
+          'bg-success-soft text-success-ink': verdict.tone === 'success',
+          'bg-destructive-soft text-destructive-ink': verdict.tone === 'danger',
+          'border border-border bg-surface': verdict.tone === 'neutral',
+        }"
+      >
+        <div class="flex flex-[1_1_360px] items-start gap-3.5">
+          <span
+            aria-hidden="true"
+            class="flex size-8 shrink-0 items-center justify-center rounded-full"
+            :class="
+              verdict.tone === 'success'
+                ? 'bg-success text-white dark:text-zinc-950'
+                : 'bg-muted text-muted-foreground'
+            "
           >
-            {{
-              selectedCandidate
-                ? `Selected · ${candidateLabel(selectedCandidate)}`
-                : `No strategy selected · ${report.stop_reason}`
-            }}
-          </v-chip>
-
-          <v-row class="mt-5">
-            <v-col cols="12" sm="6" lg="3">
-              <v-sheet class="summary-tile pa-4" rounded="lg">
-                <div class="detail-label">Asset</div>
-                <strong>{{ report.symbol }}</strong>
-              </v-sheet>
-            </v-col>
-            <v-col cols="12" sm="6" lg="3">
-              <v-sheet class="summary-tile pa-4" rounded="lg">
-                <div class="detail-label">Benchmark</div>
-                <strong>{{ benchmarkLabel }}</strong>
-              </v-sheet>
-            </v-col>
-            <v-col cols="12" sm="6" lg="3">
-              <v-sheet class="summary-tile pa-4" rounded="lg">
-                <div class="detail-label">Data range</div>
-                <strong>{{ dataRange }}</strong>
-              </v-sheet>
-            </v-col>
-            <v-col cols="12" sm="6" lg="3">
-              <v-sheet class="summary-tile pa-4" rounded="lg">
-                <div class="detail-label">Data source</div>
-                <strong>{{ dataSourceLabel }}</strong>
-              </v-sheet>
-            </v-col>
-          </v-row>
-
-          <v-alert v-if="report.research_incomplete" class="mt-5" type="warning" variant="tonal">
-            <strong>Research incomplete:</strong> Out-of-sample validation was not completed.
-            In-sample results are shown for audit only.
-          </v-alert>
-        </v-card-text>
-      </v-card>
-
-      <v-card class="surface-card mb-7">
-        <v-card-text class="pa-6">
-          <div class="section-kicker mb-2">Interactive evidence</div>
-          <h2 class="section-title mb-2">Equity and Drawdown curves</h2>
-          <p class="text-medium-emphasis mb-5">
-            Asset Buy and Hold and one default strategy are visible initially. B/S transaction
-            tags and trade-date hover appear only while the asset reference and exactly one
-            strategy are visible. Showing multiple strategies or hiding the asset reference hides
-            both transaction displays.
-          </p>
-          <ReportChart
-            v-if="hasFinalEvaluation"
-            :report="report"
-            @focus-trade-details="focusTradeDetails"
-          />
-          <v-empty-state v-else title="No final evaluation results" />
-        </v-card-text>
-      </v-card>
-
-      <v-card class="surface-card mb-7">
-        <v-card-text class="pa-6 pb-3">
-          <div class="section-kicker mb-2">Deterministic comparison</div>
-          <h2 class="section-title mb-2">Strategy metrics</h2>
-          <p class="text-medium-emphasis">
-            All evaluated candidates remain visible; selected rows are highlighted.
-          </p>
-        </v-card-text>
-        <div class="report-table-shell">
-          <v-table class="report-table" density="compact">
-            <thead>
-              <tr>
-                <th>Candidate</th>
-                <th>Segment</th>
-                <th>Parameters</th>
-                <th>Costs</th>
-                <th v-for="([name, label]) in metricColumns" :key="name">{{ label }}</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="row in metricRows"
-                :key="`${row.candidate.id}-${row.segment}`"
-                :class="{ 'selected-row': row.candidate.id === report.selected_candidate_id }"
-              >
-                <td>{{ candidateLabel(row.candidate) }}</td>
-                <td>{{ segmentLabel(row.segment) }}</td>
-                <td>{{ parameters(row.candidate.parameters) }}</td>
-                <td>
-                  {{ costs(row.candidate.transaction_cost_bps, row.candidate.slippage_bps) }}
-                </td>
-                <td v-for="([name]) in metricColumns" :key="name">
-                  {{ metric(name, row.metrics?.[name]) }}
-                </td>
-              </tr>
-              <tr v-if="metricRows.length === 0">
-                <td :colspan="4 + metricColumns.length">No completed backtests.</td>
-              </tr>
-            </tbody>
-          </v-table>
+            <Check v-if="verdict.tone === 'success'" class="size-4" :stroke-width="2.5" />
+            <Minus v-else class="size-4" :stroke-width="2.5" />
+          </span>
+          <div class="flex flex-col gap-1">
+            <span class="text-base font-semibold">{{ verdict.title }}</span>
+            <span v-if="verdict.body">{{ verdict.body }}</span>
+          </div>
         </div>
-      </v-card>
+        <div v-if="comparison.length" class="flex flex-[1_1_320px] flex-col justify-center gap-2">
+          <div
+            v-for="row in comparison"
+            :key="row.label"
+            class="grid grid-cols-[150px_minmax(0,1fr)_64px] items-center gap-2.5 text-[13px]"
+          >
+            <span class="truncate">{{ row.label }}</span>
+            <span aria-hidden="true" class="h-2 rounded-full bg-current/10">
+              <span
+                class="block h-full origin-left animate-grow rounded-full"
+                :style="{ width: row.width, background: row.color, animationDelay: row.delay }"
+              />
+            </span>
+            <span class="text-right font-semibold tabular-nums">{{ row.text }}</span>
+          </div>
+        </div>
+      </section>
 
-      <TradeDetails
-        ref="tradeDetails"
-        :candidates="report.candidates"
-        :default-candidate-id="defaultCandidateId"
-        :selected-candidate-id="report.selected_candidate_id"
-        :initial-capital="report.initial_capital"
-        :bar-interval="report.bar_interval"
+      <DeployStrategy
+        v-if="deployable"
+        :thread-id="threadId"
+        class="animate-rise [animation-delay:90ms]"
       />
 
-      <v-card v-if="report.critic_review_status" class="surface-card mb-7">
-        <v-card-text class="pa-6">
-          <div class="section-kicker mb-2">Independent Agent review</div>
-          <h2 class="section-title mb-2">AI Critic Review</h2>
-          <p class="text-medium-emphasis mb-5">
-            The Critic Agent reviewed the frozen Research draft without recomputing the backtest.
+      <Alert v-if="report.research_incomplete" variant="warning">
+        <CircleAlert />
+        <AlertDescription>
+          Out-of-sample validation was not completed; in-sample results are shown for audit only.
+        </AlertDescription>
+      </Alert>
+
+      <section
+        v-if="stats.length"
+        aria-labelledby="results"
+        class="flex animate-rise flex-col gap-3 [animation-delay:120ms]"
+      >
+        <h2 id="results" class="text-base font-semibold">
+          {{ primaryTest ? 'Out-of-sample result' : 'In-sample result' }}
+        </h2>
+        <dl
+          class="grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] overflow-hidden rounded-xl border border-border"
+        >
+          <div
+            v-for="stat in stats"
+            :key="stat.label"
+            class="flex flex-col gap-1 border-r border-hairline px-4.5 py-4 last:border-0"
+          >
+            <dt class="text-[13px] text-muted-foreground">{{ stat.label }}</dt>
+            <dd class="text-2xl font-semibold tracking-tight tabular-nums">{{ stat.value }}</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section
+        aria-labelledby="curves"
+        class="flex animate-rise flex-col gap-3.5 [animation-delay:180ms]"
+      >
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <h2 id="curves" class="text-base font-semibold">Curves</h2>
+          <ToggleGroupRoot
+            v-model="metric"
+            type="single"
+            aria-label="Metric"
+            class="inline-flex rounded-lg bg-muted p-0.75"
+          >
+            <ToggleGroupItem
+              v-for="option in ['equity', 'drawdown'] as const"
+              :key="option"
+              :value="option"
+              class="h-7 cursor-pointer rounded-md px-3 text-[13px] font-medium text-muted-foreground capitalize transition-colors duration-150 data-[state=on]:bg-background data-[state=on]:text-foreground data-[state=on]:shadow-[0_1px_2px_rgb(0_0_0/0.08)]"
+            >
+              {{ option }}
+            </ToggleGroupItem>
+          </ToggleGroupRoot>
+        </div>
+        <div role="group" aria-label="Series" class="flex flex-wrap gap-2">
+          <button
+            v-for="item in legend"
+            :key="item.key"
+            type="button"
+            :aria-pressed="item.pressed"
+            class="inline-flex h-7.5 cursor-pointer items-center gap-2 rounded-full border px-2.5 text-[13px] transition-colors duration-150 hover:border-input"
+            :class="
+              item.pressed ? 'bg-background text-foreground' : 'border-border bg-surface text-faint'
+            "
+            :style="item.pressed ? { borderColor: item.color } : undefined"
+            @click="item.toggle"
+          >
+            <span
+              aria-hidden="true"
+              class="w-3.5 border-t-2"
+              :class="item.dashed && 'border-dashed'"
+              :style="{ borderColor: item.color }"
+            />
+            {{ item.label }}
+          </button>
+        </div>
+        <p class="text-[13px] text-faint">{{ hint }}</p>
+        <div class="grid grid-cols-[repeat(auto-fit,minmax(420px,1fr))] gap-4">
+          <SegmentChart
+            v-for="segment in segments"
+            :key="segment.key"
+            :title="segment.title"
+            :summary="segment.summary"
+            :option="segment.option"
+          />
+        </div>
+      </section>
+
+      <section
+        aria-labelledby="candidates"
+        class="flex animate-rise flex-col gap-3 [animation-delay:240ms]"
+      >
+        <div class="flex flex-col gap-0.5">
+          <h2 id="candidates" class="text-base font-semibold">All candidates</h2>
+          <p class="text-muted-foreground">
+            Chosen on in-sample evidence, then evaluated once on the frozen out-of-sample period.
           </p>
-          <v-chip color="secondary" variant="tonal">
-            Final verdict · {{ criticFinalVerdict }}
-          </v-chip>
-          <v-sheet
+        </div>
+        <CandidateTable
+          :candidates="candidates"
+          :colors="colors"
+          :selected-id="report.selected_candidate_id"
+        />
+        <p class="text-[13px] text-faint">
+          Out-of-sample columns unless noted. Every segment starts from
+          {{
+            report.initial_capital.toLocaleString('en-US', {
+              style: 'currency',
+              currency: 'USD',
+              maximumFractionDigits: 0,
+            })
+          }}.
+        </p>
+      </section>
+
+      <div class="flex animate-rise flex-wrap items-start gap-8 [animation-delay:300ms]">
+        <section aria-labelledby="critic" class="flex min-w-0 flex-[999_1_560px] flex-col gap-3">
+          <h2 id="critic" class="text-base font-semibold">Critic review</h2>
+          <p v-if="!report.critic_reviews.length" class="text-muted-foreground">
+            The Critic review did not finish, so no verdict is shown.
+          </p>
+          <article
             v-for="(review, index) in report.critic_reviews"
             :key="index"
-            class="summary-tile pa-5 mt-4"
-            rounded="lg"
+            class="flex flex-col gap-2"
           >
-            <div class="detail-label mb-2">Round {{ index + 1 }} · {{ review.verdict }}</div>
-            <strong>{{ review.summary }}</strong>
-            <ul v-if="review.issues?.length" class="mt-3">
+            <Badge :variant="CRITIC_VERDICT[review.verdict].tone" size="sm">
+              Round {{ index + 1 }} · {{ CRITIC_VERDICT[review.verdict].label }}
+            </Badge>
+            <p>{{ review.summary }}</p>
+            <ul v-if="review.issues.length" class="list-disc pl-5 text-muted-foreground">
               <li v-for="issue in review.issues" :key="issue">{{ issue }}</li>
             </ul>
-            <p v-if="review.required_revision" class="mt-3 mb-0">
-              <strong>Requested revision:</strong> {{ review.required_revision }}
+            <p v-if="review.required_revision" class="text-muted-foreground">
+              <span class="font-medium text-foreground">Requested revision:</span>
+              {{ review.required_revision }}
             </p>
-          </v-sheet>
-          <v-alert v-if="report.critic_reviews.length === 0" class="mt-4" type="warning" variant="tonal">
-            Critic validation did not finish; no verdict was fabricated.
-          </v-alert>
-        </v-card-text>
-      </v-card>
+          </article>
+        </section>
+        <section aria-labelledby="limits" class="flex min-w-0 flex-[1_1_320px] flex-col gap-3">
+          <h2 id="limits" class="text-base font-semibold">Limitations</h2>
+          <ul
+            v-if="report.limitations.length"
+            class="flex list-disc flex-col gap-1.5 pl-5 text-zinc-700 dark:text-zinc-300"
+          >
+            <li v-for="item in report.limitations" :key="item">{{ item }}</li>
+          </ul>
+          <p v-else class="text-muted-foreground">No limitations were reported.</p>
+          <template v-if="report.warnings.length">
+            <h3 class="mt-2 font-semibold">Warnings</h3>
+            <ul class="flex list-disc flex-col gap-1.5 pl-5 text-warning-ink">
+              <li v-for="item in report.warnings" :key="item">{{ item }}</li>
+            </ul>
+          </template>
+        </section>
+      </div>
 
-      <v-row>
-        <v-col cols="12" md="6">
-          <v-card class="surface-card h-100">
-            <v-card-text class="pa-6">
-              <h2 class="section-title mb-4">Warnings</h2>
-              <ul v-if="report.warnings.length"><li v-for="item in report.warnings" :key="item">{{ item }}</li></ul>
-              <p v-else class="text-medium-emphasis">No warnings.</p>
-            </v-card-text>
-          </v-card>
-        </v-col>
-        <v-col cols="12" md="6">
-          <v-card class="surface-card h-100">
-            <v-card-text class="pa-6">
-              <h2 class="section-title mb-4">Limitations</h2>
-              <ul v-if="report.limitations.length"><li v-for="item in report.limitations" :key="item">{{ item }}</li></ul>
-              <p v-else class="text-medium-emphasis">No additional limitations were supplied.</p>
-            </v-card-text>
-          </v-card>
-        </v-col>
-      </v-row>
+      <section
+        v-if="report.market_context_summary || report.market_context_sources.length"
+        aria-labelledby="context"
+        class="flex animate-rise flex-col gap-3 [animation-delay:340ms]"
+      >
+        <h2 id="context" class="text-base font-semibold">Market context</h2>
+        <p v-if="report.market_context_summary" class="max-w-190">
+          {{ report.market_context_summary }}
+        </p>
+        <ul
+          v-if="report.market_context_sources.length"
+          class="overflow-hidden rounded-xl border border-border"
+        >
+          <li
+            v-for="source in report.market_context_sources"
+            :key="source.id"
+            class="flex flex-col gap-1 border-b border-hairline px-4 py-3 transition-colors duration-150 last:border-0 hover:bg-surface"
+          >
+            <div class="flex flex-wrap items-center gap-2.5">
+              <Badge size="sm">{{ SOURCE_LABELS[source.source_type] }}</Badge>
+              <a
+                :href="source.url"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="font-medium hover:text-brand"
+              >
+                {{ source.title }}
+              </a>
+              <span class="text-[13px] text-faint"
+                >{{ source.source }} · {{ source.published_at }}</span
+              >
+            </div>
+            <p class="line-clamp-2 text-[13px] text-muted-foreground">{{ source.excerpt }}</p>
+          </li>
+        </ul>
+      </section>
 
-      <footer class="report-footer mt-7">
+      <section
+        aria-labelledby="trades"
+        class="flex animate-rise flex-col gap-3 [animation-delay:380ms]"
+      >
+        <div class="flex flex-col gap-0.5">
+          <h2 id="trades" class="text-base font-semibold">Trades</h2>
+          <p class="text-muted-foreground">
+            Opening a strategy here shows it alone on the curves above.
+          </p>
+        </div>
+        <TradeLedger
+          :candidates="candidates"
+          :colors="colors"
+          :selected-id="report.selected_candidate_id"
+          :open-id="openId"
+          :bar-interval="report.bar_interval"
+          @toggle="toggleLedger"
+        />
+      </section>
+
+      <p class="border-t border-hairline pt-4 text-[13px] text-faint">
         <template v-if="report.bar_interval === '1m'">
-          This report uses adjusted 1-minute XNYS regular-session data, next-minute-open execution,
-          user-confirmed session counts, daily forced liquidation, independent sample-in/sample-out
-          capital, and Session Buy and Hold. Indicator state and the logical target may continue
-          across sessions, but actual positions never remain overnight. Annualized return,
-          annualized volatility, and Sharpe ratio are N/A.
+          Adjusted 1-minute regular-session bars, next-minute-open execution and a flat position at
+          every session close; annualized metrics do not apply.
         </template>
-        <template v-else>
-          This report uses adjusted daily data, next-open execution, a 70/30 chronological split,
-          a 0% risk-free rate, and deterministic calculations.
-        </template>
-        “In-sample” means research on the earlier time segment; no machine-learning model is
-        trained. Past performance is not a guarantee of future results.
-      </footer>
+        <template v-else
+          >Next-open execution, 70/30 chronological split, 0% risk-free rate.</template
+        >
+        Simulated results; past performance does not predict future returns.
+      </p>
     </template>
-  </v-container>
+  </main>
 </template>
-
-<style scoped>
-.report-page {
-  padding-bottom: 4rem;
-}
-
-.report-hero {
-  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-  background: rgb(var(--v-theme-surface));
-}
-
-.report-title {
-  max-width: 60rem;
-  font-size: clamp(2rem, 5vw, 3.5rem);
-  line-height: 1.02;
-  letter-spacing: -0.045em;
-}
-
-.summary-tile {
-  height: 100%;
-  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-  background: rgb(var(--v-theme-surface-variant));
-}
-
-.report-table-shell {
-  overflow-x: auto;
-}
-
-.report-table {
-  min-width: 79rem;
-}
-
-.report-table th,
-.report-table td {
-  white-space: nowrap;
-}
-
-.report-table th:first-child,
-.report-table td:first-child,
-.report-table th:nth-child(2),
-.report-table td:nth-child(2),
-.report-table th:nth-child(3),
-.report-table td:nth-child(3) {
-  text-align: left;
-}
-
-.selected-row td {
-  background: rgba(var(--v-theme-primary), 0.1);
-}
-
-.report-footer {
-  padding: 1.25rem;
-  color: rgb(var(--v-theme-on-surface-variant));
-  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-  border-radius: 1rem;
-  background: rgba(var(--v-theme-surface), 0.75);
-  font-size: 0.875rem;
-}
-
-li + li {
-  margin-top: 0.4rem;
-}
-</style>

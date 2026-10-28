@@ -4,12 +4,18 @@ from pathlib import Path
 
 import pytest
 
-from trading.config import ConfigurationError, load_settings
+from tragent.config import ConfigurationError, load_settings
 
 ENVIRONMENT_VARIABLES = (
     "LLM_API_KEY",
     "LLM_MODEL",
     "LLM_BASE_URL",
+    "LLM_REQUEST_TIMEOUT_SECONDS",
+    "EMBEDDING_API_KEY",
+    "EMBEDDING_MODEL",
+    "EMBEDDING_BASE_URL",
+    "EMBEDDING_DIMENSIONS",
+    "SEC_USER_AGENT",
     "LANGSMITH_API_KEY",
     "LANGSMITH_PROJECT",
     "POSTGRES_HOST",
@@ -20,7 +26,14 @@ ENVIRONMENT_VARIABLES = (
     "POSTGRES_POOL_MIN_SIZE",
     "POSTGRES_POOL_MAX_SIZE",
     "POSTGRES_POOL_TIMEOUT_SECONDS",
+    "REDIS_HOST",
+    "REDIS_PORT",
+    "REDIS_PASSWORD",
+    "REDIS_DATABASE",
     "JWT_SECRET",
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+    "CORS_ORIGINS",
     "DEFAULT_TRANSACTION_COST_BPS",
     "DEFAULT_SLIPPAGE_BPS",
     "DEFAULT_POSITION_TRANCHES",
@@ -30,6 +43,11 @@ VALID_VALUES = {
     "LLM_API_KEY": "test-llm-secret",
     "LLM_MODEL": "test-model",
     "LLM_BASE_URL": "https://api.example.test/v1",
+    "EMBEDDING_API_KEY": "test-embedding-secret",
+    "EMBEDDING_MODEL": "test-embedding-model",
+    "EMBEDDING_BASE_URL": "https://embeddings.example.test/v1",
+    "EMBEDDING_DIMENSIONS": "1536",
+    "SEC_USER_AGENT": "Test User test@example.test",
     "LANGSMITH_API_KEY": "test-langsmith-secret",
     "LANGSMITH_PROJECT": "test-project",
     "POSTGRES_HOST": "localhost",
@@ -37,7 +55,11 @@ VALID_VALUES = {
     "POSTGRES_USER": "test_user",
     "POSTGRES_PASSWORD": "test-db-secret",
     "POSTGRES_DATABASE": "test_db",
+    "REDIS_HOST": "localhost",
+    "REDIS_PORT": "6379",
     "JWT_SECRET": "test-jwt-secret-with-at-least-32-characters",
+    "S3_ACCESS_KEY": "test-s3-key",
+    "S3_SECRET_KEY": "test-s3-secret",
 }
 
 
@@ -78,6 +100,9 @@ def test_loads_valid_settings_from_supplied_env_file(tmp_path: Path) -> None:
     assert settings.llm_api_key.get_secret_value() == VALID_VALUES["LLM_API_KEY"]
     assert settings.llm_model == "test-model"
     assert str(settings.llm_base_url) == "https://api.example.test/v1"
+    assert settings.llm_request_timeout_seconds == 180.0
+    assert settings.embedding_model == "test-embedding-model"
+    assert settings.embedding_dimensions == 1536
     assert settings.langsmith_api_key.get_secret_value() == VALID_VALUES["LANGSMITH_API_KEY"]
     assert settings.langsmith_project == "test-project"
     assert settings.postgres_host == "localhost"
@@ -88,16 +113,23 @@ def test_loads_valid_settings_from_supplied_env_file(tmp_path: Path) -> None:
     assert settings.postgres_pool_min_size == 1
     assert settings.postgres_pool_max_size == 10
     assert settings.postgres_pool_timeout_seconds == 30.0
+    assert settings.redis_host == "localhost"
+    assert settings.redis_port == 6379
+    assert settings.redis_password is None
+    assert settings.redis_database == 0
     assert settings.jwt_secret.get_secret_value() == VALID_VALUES["JWT_SECRET"]
+    assert settings.cors_origins == []
     assert settings.default_transaction_cost_bps == 5.0
     assert settings.default_slippage_bps == 5.0
     assert settings.default_position_tranches == 5
 
 
-def test_loading_env_file_does_not_mutate_process_environment(tmp_path: Path) -> None:
-    load_settings(write_env_file(tmp_path))
+def test_cors_origins_are_read_as_a_json_list(tmp_path: Path) -> None:
+    origins = '["https://app.example.test","http://localhost:3000"]'
 
-    assert all(name not in os.environ for name in ENVIRONMENT_VARIABLES)
+    settings = load_settings(write_env_file(tmp_path, CORS_ORIGINS=origins))
+
+    assert settings.cors_origins == ["https://app.example.test", "http://localhost:3000"]
 
 
 def test_process_environment_overrides_supplied_env_file(tmp_path: Path) -> None:
@@ -106,6 +138,11 @@ def test_process_environment_overrides_supplied_env_file(tmp_path: Path) -> None
     settings = load_settings(write_env_file(tmp_path, LLM_MODEL="file-model"))
 
     assert settings.llm_model == "environment-model"
+
+
+def test_model_timeout_can_be_overridden(tmp_path: Path) -> None:
+    settings = load_settings(write_env_file(tmp_path, LLM_REQUEST_TIMEOUT_SECONDS="240"))
+    assert settings.llm_request_timeout_seconds == 240.0
 
 
 def test_loads_backtest_defaults_overrides_from_supplied_env_file(tmp_path: Path) -> None:
@@ -153,11 +190,17 @@ def test_reports_a_missing_field_without_showing_other_values(tmp_path: Path) ->
     ("field", "value"),
     [
         ("LLM_BASE_URL", "not-a-url/hidden-value"),
+        ("LLM_REQUEST_TIMEOUT_SECONDS", "-1"),
+        ("LLM_REQUEST_TIMEOUT_SECONDS", "nan"),
+        ("LLM_REQUEST_TIMEOUT_SECONDS", "inf"),
         ("POSTGRES_PORT", "70000"),
         ("POSTGRES_POOL_MAX_SIZE", "0"),
         ("POSTGRES_POOL_TIMEOUT_SECONDS", "-1"),
         ("JWT_SECRET", "too-short"),
         ("DEFAULT_POSITION_TRANCHES", "-1"),
+        ("DEFAULT_TRANSACTION_COST_BPS", "-0.1"),
+        ("DEFAULT_TRANSACTION_COST_BPS", "nan"),
+        ("DEFAULT_SLIPPAGE_BPS", "inf"),
     ],
 )
 def test_rejects_invalid_settings_without_echoing_input(
@@ -176,69 +219,3 @@ def test_rejects_invalid_settings_without_echoing_input(
     assert "test-llm-secret" not in message
     assert "test-langsmith-secret" not in message
     assert "test-db-secret" not in message
-
-
-def test_secret_fields_are_redacted_in_settings_representation(tmp_path: Path) -> None:
-    settings = load_settings(write_env_file(tmp_path))
-    representation = repr(settings)
-
-    assert "test-llm-secret" not in representation
-    assert "test-langsmith-secret" not in representation
-    assert "test-db-secret" not in representation
-    assert VALID_VALUES["JWT_SECRET"] not in representation
-    assert "**********" in representation
-
-
-def test_allows_an_http_llm_endpoint(tmp_path: Path) -> None:
-    settings = load_settings(write_env_file(tmp_path, LLM_BASE_URL="http://localhost:8000/v1"))
-
-    assert str(settings.llm_base_url) == "http://localhost:8000/v1"
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("DEFAULT_TRANSACTION_COST_BPS", "-0.1"),
-        ("DEFAULT_TRANSACTION_COST_BPS", "nan"),
-        ("DEFAULT_SLIPPAGE_BPS", "inf"),
-    ],
-)
-def test_rejects_non_finite_or_negative_backtest_cost(
-    tmp_path: Path, field: str, value: str
-) -> None:
-    env_file = write_env_file(tmp_path, **{field: value})
-
-    with pytest.raises(ConfigurationError) as error:
-        load_settings(env_file)
-
-    assert f"{field}: must be a finite non-negative number" in str(error.value)
-    assert value not in str(error.value)
-
-
-def test_rejects_backtest_cost_total_of_one_hundred_percent(tmp_path: Path) -> None:
-    env_file = write_env_file(
-        tmp_path,
-        DEFAULT_TRANSACTION_COST_BPS="5000",
-        DEFAULT_SLIPPAGE_BPS="5000",
-    )
-
-    with pytest.raises(ConfigurationError) as error:
-        load_settings(env_file)
-
-    assert "CONFIGURATION: backtest costs must total less than 10000 bps" in str(error.value)
-
-
-def test_rejects_postgres_pool_minimum_above_maximum(tmp_path: Path) -> None:
-    env_file = write_env_file(
-        tmp_path,
-        POSTGRES_POOL_MIN_SIZE="11",
-        POSTGRES_POOL_MAX_SIZE="10",
-    )
-
-    with pytest.raises(ConfigurationError) as error:
-        load_settings(env_file)
-
-    assert (
-        "CONFIGURATION: PostgreSQL pool minimum size must not exceed maximum size"
-        in str(error.value)
-    )

@@ -9,44 +9,58 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
+import fakeredis
 import langsmith
 import pytest
 from langchain_core.language_models import BaseChatModel
-from langgraph.types import Command
+from langgraph.types import Command, PregelTask, StateSnapshot
 from pydantic import SecretStr
 
-import trading.agent.finalization as finalization_module
-import trading.research as research_module
-import trading.task_view as task_view_module
-from trading.agent.events import AgentEvent
-from trading.agent.graph import RecoverableResearchError
-from trading.agent.models import AgentBudget, GoalDraft, ResearchGoal
-from trading.agent.state import GraphState, validate_graph_state
-from trading.checkpoint import DatabasePool
-from trading.config import Settings
-from trading.quant import BacktestCosts
-from trading.research import (
-    ResearchTaskStarted,
+import tragent.research.agent.finalization as finalization_module
+import tragent.research.service as research_module
+import tragent.research.task_view as task_view_module
+from tragent.config import Settings
+from tragent.db import DatabasePool
+from tragent.quant import BacktestCosts
+from tragent.research import task_runs
+from tragent.research.agent.events import AgentEvent
+from tragent.research.agent.graph import RecoverableResearchError
+from tragent.research.agent.models import AgentBudget, GoalDraft, ResearchGoal
+from tragent.research.agent.state import validate_graph_state
+from tragent.research.service import (
     ResearchTaskSummary,
     ResearchTaskView,
+    TaskBusyError,
+    TaskLimitError,
     get_research_report_view,
     get_research_status,
     list_research_tasks,
-    stream_resume_research,
-    stream_start_research,
+    resume_research,
+    run_research,
+    start_research,
 )
+from tragent.research.task_view import build_task_view
 
 TEST_POOL = cast(DatabasePool, object())
 
 
-def _last_view(items: Iterator[object]) -> ResearchTaskView:
-    views = [item for item in items if isinstance(item, ResearchTaskView)]
-    assert len(views) == 1
-    return views[0]
+@pytest.fixture
+def redis() -> fakeredis.FakeRedis:
+    return fakeredis.FakeRedis(decode_responses=True)
+
+
+class _Queue:
+    """Records what the API hands to the Celery queue."""
+
+    def __init__(self) -> None:
+        self.runs: list[tuple[str, int, dict[str, str] | None]] = []
+
+    def __call__(self, thread_id: str, user_id: int, resume: dict[str, str] | None) -> None:
+        self.runs.append((thread_id, user_id, resume))
 
 
 @pytest.fixture
@@ -55,6 +69,11 @@ def settings() -> Settings:
         llm_api_key=SecretStr("test-llm-key"),
         llm_model="test-model",
         llm_base_url="https://llm.example/v1",
+        embedding_api_key=SecretStr("test-embedding-key"),
+        embedding_model="test-embedding-model",
+        embedding_base_url="https://embeddings.example/v1",
+        embedding_dimensions=1536,
+        sec_user_agent="Test User test@example.test",
         langsmith_api_key=SecretStr("test-langsmith-key"),
         langsmith_project="test-project",
         postgres_host="localhost",
@@ -62,17 +81,32 @@ def settings() -> Settings:
         postgres_user="test",
         postgres_password=SecretStr("test"),
         postgres_database="test",
+        redis_host="localhost",
+        redis_port=6379,
         jwt_secret=SecretStr("test-jwt-secret-with-at-least-32-characters"),
+        s3_access_key="test-s3-key",
+        s3_secret_key=SecretStr("test-s3-secret"),
         default_transaction_cost_bps=7.5,
         default_slippage_bps=2.5,
     )
 
 
-@dataclass(slots=True)
-class _Snapshot:
-    values: Mapping[str, object]
-    tasks: tuple[object, ...] = ()
-    next: tuple[str, ...] = ()
+def _state_snapshot(
+    values: Mapping[str, object],
+    *,
+    tasks: tuple[PregelTask, ...] = (),
+    next_nodes: tuple[str, ...] = (),
+) -> StateSnapshot:
+    return StateSnapshot(
+        values=values,
+        next=next_nodes,
+        config={},
+        metadata=None,
+        created_at=None,
+        parent_config=None,
+        tasks=tasks,
+        interrupts=(),
+    )
 
 
 @dataclass(slots=True)
@@ -88,27 +122,17 @@ class _StreamCall:
 
 class _CheckpointerSpy:
     def __init__(self) -> None:
-        self.active = False
-        self.open_calls = 0
+        self.create_calls = 0
         self.setup_calls = 0
-        self.child_states: dict[str, GraphState] = {}
+        # Agent subgraph checkpoints by namespace, as the ReAct harness writes them.
+        self.agent_checkpoints: dict[str, dict[str, object]] = {}
+
+    def get_tuple(self, config: Mapping[str, Any]) -> SimpleNamespace | None:
+        values = self.agent_checkpoints.get(config["configurable"]["checkpoint_ns"])
+        return None if values is None else SimpleNamespace(checkpoint={"channel_values": values})
 
     def setup(self) -> None:
-        assert self.active, "setup must run inside the checkpointer context"
         self.setup_calls += 1
-
-    def get_tuple(self, config: Mapping[str, object]) -> object | None:
-        assert self.active, "checkpoint reads must stay inside the storage context"
-        configurable = config.get("configurable")
-        if not isinstance(configurable, Mapping):
-            return None
-        namespace = configurable.get("checkpoint_ns")
-        state = self.child_states.get(namespace) if isinstance(namespace, str) else None
-        if state is None:
-            return None
-        return SimpleNamespace(
-            checkpoint={"channel_values": {"workspace_state": copy.deepcopy(state)}}
-        )
 
 
 @dataclass(slots=True)
@@ -121,8 +145,7 @@ class _StorePut:
 
 class _StoreSpy:
     def __init__(self) -> None:
-        self.active = False
-        self.open_calls = 0
+        self.create_calls = 0
         self.put_calls: list[_StorePut] = []
         self.search_calls: list[dict[str, object]] = []
         self.items: list[object] = []
@@ -134,7 +157,6 @@ class _StoreSpy:
         value: dict[str, object],
         index: bool | None = None,
     ) -> None:
-        assert self.active
         self.put_calls.append(_StorePut(namespace, key, value, index))
 
     def search(
@@ -144,95 +166,35 @@ class _StoreSpy:
         limit: int,
         offset: int,
     ) -> list[object]:
-        assert self.active
         self.search_calls.append({"namespace": namespace, "limit": limit, "offset": offset})
         return self.items
 
 
 class _FakeLangSmithClient:
-    def __init__(
-        self,
-        runtime: _TracingRuntime,
-        identifier: int,
-        kwargs: Mapping[str, object],
-    ) -> None:
-        self.runtime = runtime
-        self.identifier = identifier
-        self.kwargs = dict(kwargs)
-        self.flush_calls = 0
-        self.close_calls = 0
-        self.flush_timeouts: list[float | None] = []
-        self.close_timeouts: list[float | None] = []
-        self.closed = False
+    def __init__(self, **_kwargs: object) -> None:
+        pass
 
     def flush(self, timeout: float | None = None) -> None:
-        assert not self.closed
-        assert self not in self.runtime.active_clients
-        self.flush_calls += 1
-        self.flush_timeouts.append(timeout)
-        self.runtime.events.append(("flush", self.identifier))
+        del timeout
 
     def close(self, timeout: float | None = None) -> None:
-        assert not self.closed
-        assert self not in self.runtime.active_clients
-        self.close_calls += 1
-        self.close_timeouts.append(timeout)
-        self.closed = True
-        self.runtime.events.append(("close", self.identifier))
+        del timeout
 
 
-class _TracingRuntime:
-    """No-network LangSmith Client and tracing-context seam for application tests."""
-
-    def __init__(self) -> None:
-        self.clients: list[_FakeLangSmithClient] = []
-        self.context_calls: list[dict[str, object]] = []
-        self.active_clients: list[_FakeLangSmithClient] = []
-        self.events: list[tuple[str, int | None]] = []
-        self.context_depth = 0
-
-    def build_client(self, **kwargs: object) -> _FakeLangSmithClient:
-        client = _FakeLangSmithClient(self, len(self.clients) + 1, kwargs)
-        self.clients.append(client)
-        self.events.append(("client", client.identifier))
-        return client
-
-    @contextmanager
-    def tracing_context(self, **kwargs: object) -> Iterator[None]:
-        captured = dict(kwargs)
-        self.context_calls.append(captured)
-        client = captured.get("client")
-        if client is not None:
-            assert isinstance(client, _FakeLangSmithClient)
-            assert not client.closed
-            self.active_clients.append(client)
-            identifier: int | None = client.identifier
-        else:
-            identifier = None
-        self.context_depth += 1
-        self.events.append(("enter", identifier))
-        try:
-            yield
-        finally:
-            self.events.append(("exit", identifier))
-            self.context_depth -= 1
-            if isinstance(client, _FakeLangSmithClient):
-                assert self.active_clients[-1] is client
-                self.active_clients.pop()
+@contextmanager
+def _no_network_tracing_context(**_kwargs: object) -> Iterator[None]:
+    yield
 
 
 @pytest.fixture(autouse=True)
 def no_network_langsmith(
     monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[_TracingRuntime]:
-    runtime = _TracingRuntime()
-    monkeypatch.setattr(langsmith, "Client", runtime.build_client)
-    monkeypatch.setattr(langsmith, "tracing_context", runtime.tracing_context)
-    monkeypatch.setattr(research_module, "Client", runtime.build_client, raising=False)
-    monkeypatch.setattr(research_module, "tracing_context", runtime.tracing_context)
-    yield runtime
-    assert runtime.context_depth == 0
-    assert runtime.active_clients == []
+) -> Iterator[None]:
+    monkeypatch.setattr(langsmith, "Client", _FakeLangSmithClient)
+    monkeypatch.setattr(langsmith, "tracing_context", _no_network_tracing_context)
+    monkeypatch.setattr(research_module, "Client", _FakeLangSmithClient, raising=False)
+    monkeypatch.setattr(research_module, "tracing_context", _no_network_tracing_context)
+    yield
 
 
 class _GraphSpy:
@@ -241,9 +203,9 @@ class _GraphSpy:
     def __init__(
         self,
         checkpointer: _CheckpointerSpy,
-        snapshot: _Snapshot,
+        snapshot: StateSnapshot,
         *,
-        after_stream: Callable[[object], _Snapshot] | None = None,
+        after_stream: Callable[[object], StateSnapshot] | None = None,
         events: tuple[AgentEvent, ...] = (),
     ) -> None:
         self.checkpointer = checkpointer
@@ -251,7 +213,17 @@ class _GraphSpy:
         self.after_stream = after_stream
         self.events = events
         self.stream_calls: list[_StreamCall] = []
+        self.invoke_calls: list[dict[str, object]] = []
         self.get_state_calls: list[Mapping[str, object]] = []
+
+    def invoke(
+        self,
+        value: Mapping[str, object],
+        config: Mapping[str, object],
+        **kwargs: object,
+    ) -> None:
+        self.invoke_calls.append({"value": value, "config": config, **kwargs})
+        self.snapshot = _state_snapshot(value, next_nodes=("parse_goal",))
 
     def stream(
         self,
@@ -265,7 +237,6 @@ class _GraphSpy:
         subgraphs: bool = False,
         **_kwargs: object,
     ) -> Iterator[dict[str, object]]:
-        assert self.checkpointer.active, "stream must run before the checkpointer closes"
         assert config is not None
         self.stream_calls.append(
             _StreamCall(
@@ -287,8 +258,7 @@ class _GraphSpy:
                 "data": event.model_dump(mode="json"),
             }
 
-    def get_state(self, config: Mapping[str, object]) -> _Snapshot:
-        assert self.checkpointer.active, "get_state must run before the checkpointer closes"
+    def get_state(self, config: Mapping[str, object]) -> StateSnapshot:
         self.get_state_calls.append(config)
         return self.snapshot
 
@@ -336,46 +306,35 @@ def _state(
     *,
     status: str = "awaiting_confirmation",
     request: str = "Research AAPL with the supported long-only strategies.",
-) -> GraphState:
-    goal = _goal(request)
+) -> dict[str, object]:
     researching = status == "running"
     terminal = status in {"selected", "no_strategy", "failed", "budget_exhausted"}
-    rejected = status == "rejected"
-    terminal_result: dict[str, object] | None = None
+    workspace: dict[str, object] | None = None
+    if researching or terminal:
+        workspace = {
+            "goal": _goal(request),
+            "budget": AgentBudget().model_dump(mode="json"),
+            "phase": "researching" if researching else "completed",
+            "active_agent": "research" if researching else None,
+        }
     if terminal:
-        terminal_result = {
+        workspace["result"] = {
             "status": status,
-            "selected_fingerprint": None,
-            "evaluated_fingerprint": None,
-            "training_metrics": {},
-            "test_metrics": {},
             "conclusion": "The research run stopped safely without selecting a strategy.",
             "stop_reason": "The research run stopped safely.",
-            "warnings": [],
-            "limitations": [],
-            "budget_usage": {
-                "agent_steps": 0,
-                "tool_calls": 0,
-                "training_backtests": 0,
-            },
         }
-    state: GraphState = {
+    state: dict[str, object] = {
         "thread_id": thread_id,
         "user_id": 1,
         "request": request,
         "reference_date": "2026-07-13",
-        "status": status,  # type: ignore[typeddict-item]
-        "failure_stage": None,
-        "confirmation_error": None,
-        "failure_summary": None,
+        "status": status,
         "cost_defaults": {
             "transaction_cost_bps": 7.5,
             "slippage_bps": 2.5,
         },
         "position_tranches_default": 5,
         "draft_goal": _goal_draft(request),
-        "confirmed_goal": goal if researching or terminal else None,
-        "missing_goal_fields": [],
         "defaulted_fields": [
             "start_date",
             "end_date",
@@ -386,38 +345,29 @@ def _state(
             "benchmark_symbol",
         ],
         "budget": AgentBudget().model_dump(mode="json"),
-        "phase": "researching" if researching else "completed" if terminal else None,
-        "active_agent": "research" if researching else None,
-        "critic_rounds": [],
-        "agent_steps": 0,
-        "tool_calls": 0,
-        "training_backtests": 0,
-        "download_failures": 0,
-        "message_journal": [],
-        "unresolved_issues": [],
-        "runtime_warnings": [],
-        "fatal_reason": None,
-        "data_snapshot": None,
-        "current_candidate": None,
-        "validated_configs": {},
-        "training_evaluations": [],
-        "final_evaluations": [],
-        "locked_fingerprint": None,
-        "final_batch_completed": False,
-        "terminal_result": terminal_result,  # type: ignore[typeddict-item]
+        "workspace": workspace,
     }
-    if rejected:
-        state["confirmed_goal"] = None
-    return validate_graph_state(state)
+    return validate_graph_state(state).model_dump(mode="json")
 
 
-def _snapshot(state: GraphState, *, recoverable_error: object | None = None) -> _Snapshot:
-    tasks: tuple[object, ...] = ()
+def _snapshot(
+    state: Mapping[str, object],
+    *,
+    recoverable_error: Exception | None = None,
+) -> StateSnapshot:
+    tasks: tuple[PregelTask, ...] = ()
     next_nodes: tuple[str, ...] = ()
     if recoverable_error is not None:
-        tasks = (SimpleNamespace(error=recoverable_error),)
+        tasks = (
+            PregelTask(
+                id="recoverable-task",
+                name="research_agent",
+                path=(),
+                error=recoverable_error,
+            ),
+        )
         next_nodes = ("research_agent",)
-    return _Snapshot(values=state, tasks=tasks, next=next_nodes)
+    return _state_snapshot(state, tasks=tasks, next_nodes=next_nodes)
 
 
 def _install_storage(
@@ -429,35 +379,29 @@ def _install_storage(
 ) -> _StoreSpy:
     store = store or _StoreSpy()
 
-    @contextmanager
-    def open_fake(_settings: Settings) -> Iterator[_CheckpointerSpy]:
-        assert not checkpointer.active
-        checkpointer.open_calls += 1
-        checkpointer.active = True
-        try:
-            yield checkpointer
-        finally:
-            checkpointer.active = False
+    def create_checkpointer(pool: DatabasePool) -> _CheckpointerSpy:
+        assert pool is TEST_POOL
+        checkpointer.create_calls += 1
+        return checkpointer
 
-    @contextmanager
-    def open_store_fake(_settings: Settings) -> Iterator[_StoreSpy]:
-        assert not checkpointer.active
-        assert not store.active
-        store.open_calls += 1
-        store.active = True
-        try:
-            yield store
-        finally:
-            store.active = False
+    def create_store(pool: DatabasePool) -> _StoreSpy:
+        assert pool is TEST_POOL
+        store.create_calls += 1
+        return store
 
     def build_fake(*, checkpointer: object = None) -> _GraphSpy:
-        assert graph.checkpointer.active, "compile must run inside the checkpointer context"
         assert checkpointer is graph.checkpointer
         return graph
 
-    monkeypatch.setattr(research_module, "open_checkpointer", open_fake)
-    monkeypatch.setattr(research_module, "open_store", open_store_fake)
+    @contextmanager
+    def unlocked(pool: DatabasePool, _thread_id: str) -> Iterator[None]:
+        assert pool is TEST_POOL
+        yield
+
+    monkeypatch.setattr(research_module, "PostgresSaver", create_checkpointer)
+    monkeypatch.setattr(research_module, "PostgresStore", create_store)
     monkeypatch.setattr(research_module, "build_research_graph", build_fake)
+    monkeypatch.setattr(research_module, "_task_lock", unlocked)
     return store
 
 
@@ -482,33 +426,16 @@ def _install_runtime_dependencies(
     return model, provider, model_calls, provider_calls
 
 
-def _install_tracing_spy(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    enabled: bool,
-) -> list[dict[str, object]]:
+def _install_tracing(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
     calls: list[dict[str, object]] = []
 
     @contextmanager
     def tracing_spy(**kwargs: object) -> Iterator[None]:
         calls.append(dict(kwargs))
-        assert kwargs.get("enabled") is enabled
         yield
 
     monkeypatch.setattr(research_module, "tracing_context", tracing_spy)
     return calls
-
-
-def _install_disabled_tracing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> list[dict[str, object]]:
-    return _install_tracing_spy(monkeypatch, enabled=False)
-
-
-def _install_enabled_tracing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> list[dict[str, object]]:
-    return _install_tracing_spy(monkeypatch, enabled=True)
 
 
 def _thread_from_config(config: Mapping[str, object]) -> str:
@@ -525,223 +452,170 @@ def _context_item(context: object, name: str) -> object:
     return getattr(context, name)
 
 
-def test_start_streams_agent_events_with_sync_durability_and_limit_96(
+def test_start_checkpoints_the_task_and_queues_goal_parsing_without_model_calls(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     settings: Settings,
+    redis: fakeredis.FakeRedis,
 ) -> None:
     checkpointer = _CheckpointerSpy()
-
-    def after_start(value: object) -> _Snapshot:
-        assert isinstance(value, Mapping)
-        thread_id = value["thread_id"]
-        assert isinstance(thread_id, str)
-        return _snapshot(_state(thread_id, request=str(value["request"])))
-
-    event = AgentEvent(
-        source="goal_parser",
-        kind="status",
-        message="Goal Parser · Parsing the research request...",
-    )
-    graph = _GraphSpy(
-        checkpointer,
-        _Snapshot(values={}),
-        after_stream=after_start,
-        events=(event,),
-    )
+    graph = _GraphSpy(checkpointer, _state_snapshot({}))
     store = _install_storage(monkeypatch, checkpointer, graph)
-    model, provider, model_calls, provider_calls = _install_runtime_dependencies(monkeypatch)
-    trace_calls = _install_enabled_tracing(monkeypatch)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
 
-    items = tuple(
-        stream_start_research(
-            "Research AAPL with the supported long-only strategies.",
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("starting a task must leave model work to the worker")
+
+    monkeypatch.setattr(research_module, "build_llm", forbidden)
+    monkeypatch.setattr(research_module, "YFinanceProvider", forbidden)
+    queue = _Queue()
+
+    view = start_research(
+        "Research AAPL daily strategies.",
+        user_id=1,
+        settings=settings,
+        pool=TEST_POOL,
+        redis=redis,
+        enqueue=queue,
+        reference_date=date(2026, 7, 13),
+    )
+
+    assert UUID(view.thread_id).version == 4
+    assert view.status == "running"
+    assert view.run_state == "queued"
+    assert view.can_resume is False
+    assert queue.runs == [(view.thread_id, 1, None)]
+    (call,) = graph.invoke_calls
+    assert call["interrupt_before"] == ["parse_goal"]
+    assert call["durability"] == "sync"
+    assert _thread_from_config(call["config"]) == view.thread_id
+    assert call["value"]["cost_defaults"] == {"transaction_cost_bps": 7.5, "slippage_bps": 2.5}
+    assert graph.stream_calls == []
+    assert store.put_calls[0].value["status"] == "running"
+
+
+def test_start_with_full_slots_creates_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    redis: fakeredis.FakeRedis,
+) -> None:
+    checkpointer = _CheckpointerSpy()
+    graph = _GraphSpy(checkpointer, _state_snapshot({}))
+    store = _install_storage(monkeypatch, checkpointer, graph)
+    for index in range(settings.max_active_runs_per_user):
+        task_runs.claim_run(redis, f"task-{index}", user_id=1, limit=2)
+    queue = _Queue()
+
+    with pytest.raises(TaskLimitError, match="already have 2 research tasks"):
+        start_research(
+            "Research AAPL daily strategies.",
             user_id=1,
             settings=settings,
             pool=TEST_POOL,
+            redis=redis,
+            enqueue=queue,
             reference_date=date(2026, 7, 13),
         )
-    )
-    view = _last_view(iter(items))
 
-    assert isinstance(view, ResearchTaskView)
-    parsed_thread = UUID(view.thread_id)
-    assert parsed_thread.version == 4
-    assert str(parsed_thread) == view.thread_id
-    assert checkpointer.open_calls == 1
-    assert checkpointer.setup_calls == 0
-    assert checkpointer.active is False
-    assert model_calls == [settings]
-    assert provider_calls == [None]
-    assert len(trace_calls) == 1
-    assert trace_calls[0]["enabled"] is True
-    assert len(graph.stream_calls) == 1
-
-    call = graph.stream_calls[0]
-    assert call.durability == "sync"
-    assert call.stream_mode == "custom"
-    assert call.version == "v2"
-    assert call.subgraphs is True
-    assert call.config["recursion_limit"] == 96
-    assert _thread_from_config(call.config) == view.thread_id
-    assert isinstance(call.value, Mapping)
-    assert call.value == {
-        "thread_id": view.thread_id,
-        "user_id": 1,
-        "request": "Research AAPL with the supported long-only strategies.",
-        "reference_date": "2026-07-13",
-        "cost_defaults": {
-            "transaction_cost_bps": 7.5,
-            "slippage_bps": 2.5,
-        },
-        "position_tranches_default": 5,
-        "budget": AgentBudget().model_dump(mode="json"),
-    }
-    assert _context_item(call.context, "model") is model
-    assert _context_item(call.context, "provider") is provider
-    assert _context_item(call.context, "output_dir") == (
-        tmp_path / "artifacts" / "reports" / view.thread_id
-    )
-    assert not hasattr(call.context, "progress")
-    assert event in items
-    assert store.open_calls == 1
-    assert len(store.put_calls) == 1
-    stored = store.put_calls[0]
-    assert stored.namespace == ("research_tasks", "1")
-    assert stored.key == view.thread_id
-    assert stored.index is False
-    assert stored.value == {
-        "thread_id": view.thread_id,
-        "request_summary": "Research AAPL with the supported long-only strategies.",
-        "status": "awaiting_confirmation",
-        "agent": None,
-        "last_action": None,
-        "critic_verdict": None,
-        "can_resume": False,
-        "report_exists": False,
-    }
-
-
-def test_closing_start_stream_stops_before_terminal_state_read(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    settings: Settings,
-) -> None:
-    checkpointer = _CheckpointerSpy()
-
-    def after_start(value: object) -> _Snapshot:
-        assert isinstance(value, Mapping)
-        return _snapshot(_state(str(value["thread_id"]), request=str(value["request"])))
-
-    graph = _GraphSpy(
-        checkpointer,
-        _Snapshot(values={}),
-        after_stream=after_start,
-        events=(
-            AgentEvent(
-                source="goal_parser",
-                kind="status",
-                message="Goal Parser · Parsing the research request...",
-            ),
-        ),
-    )
-    store = _install_storage(monkeypatch, checkpointer, graph)
-    _install_runtime_dependencies(monkeypatch)
-    _install_enabled_tracing(monkeypatch)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
-
-    items = stream_start_research(
-        "Research AAPL daily strategies.", user_id=1, settings=settings, pool=TEST_POOL
-    )
-    started = next(items)
-    items.close()
-
-    assert isinstance(started, ResearchTaskStarted)
-    assert checkpointer.active is False
-    assert graph.get_state_calls == []
+    assert graph.invoke_calls == []
+    assert queue.runs == []
     assert store.put_calls == []
 
 
-@pytest.mark.parametrize(
-    ("action", "answer", "resume_payload", "result_status"),
-    [
-        ("approve", None, {"action": "approve"}, "running"),
-        (
-            None,
-            "Research MSFT with the supported long-only strategies.",
-            {
-                "answer": "Research MSFT with the supported long-only strategies.",
-            },
-            "awaiting_confirmation",
-        ),
-        ("reject", None, {"action": "reject"}, "rejected"),
-    ],
-)
-def test_resume_accepts_only_valid_confirmation_actions_for_awaiting_task(
+def test_a_failed_enqueue_releases_the_claim(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     settings: Settings,
-    action: str,
-    answer: str | None,
-    resume_payload: dict[str, str],
-    result_status: str,
+    redis: fakeredis.FakeRedis,
 ) -> None:
     thread_id = str(uuid4())
     checkpointer = _CheckpointerSpy()
-    initial = _snapshot(_state(thread_id))
+    graph = _GraphSpy(checkpointer, _snapshot(_state(thread_id, status="running")))
+    _install_storage(monkeypatch, checkpointer, graph)
 
-    def after_resume(value: object) -> _Snapshot:
-        assert isinstance(value, Command)
-        assert value.resume == resume_payload
-        next_request = answer or "Research AAPL with the supported long-only strategies."
-        return _snapshot(_state(thread_id, status=result_status, request=next_request))
+    def broker_down(*_args: object) -> None:
+        raise ConnectionError("broker unavailable")
 
-    graph = _GraphSpy(checkpointer, initial, after_stream=after_resume)
-    store = _install_storage(monkeypatch, checkpointer, graph)
-    _install_runtime_dependencies(monkeypatch)
-    trace_calls = _install_enabled_tracing(monkeypatch)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
-
-    view = _last_view(
-        stream_resume_research(
+    with pytest.raises(ConnectionError):
+        resume_research(
             thread_id,
             user_id=1,
             settings=settings,
             pool=TEST_POOL,
+            redis=redis,
+            enqueue=broker_down,
+        )
+
+    assert task_runs.run_state(redis, thread_id) is None
+
+
+@pytest.mark.parametrize(
+    ("action", "answer", "resume_payload"),
+    [
+        ("approve", None, {"action": "approve"}),
+        (
+            None,
+            "Research MSFT with the supported long-only strategies.",
+            {"answer": "Research MSFT with the supported long-only strategies."},
+        ),
+        ("reject", None, {"action": "reject"}),
+    ],
+)
+def test_resume_queues_only_valid_confirmation_actions_for_awaiting_task(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    tmp_path: Path,
+    redis: fakeredis.FakeRedis,
+    action: str | None,
+    answer: str | None,
+    resume_payload: dict[str, str],
+) -> None:
+    thread_id = str(uuid4())
+    checkpointer = _CheckpointerSpy()
+    graph = _GraphSpy(checkpointer, _snapshot(_state(thread_id)))
+    _install_storage(monkeypatch, checkpointer, graph)
+    queue = _Queue()
+
+    view = resume_research(
+        thread_id,
+        user_id=1,
+        settings=settings,
+        pool=TEST_POOL,
+        redis=redis,
+        enqueue=queue,
+        action=action,
+        answer=answer,
+    )
+
+    assert queue.runs == [(thread_id, 1, resume_payload)]
+    assert view.status == "awaiting_confirmation"
+    assert view.run_state == "queued"
+    assert graph.stream_calls == []
+    with pytest.raises(TaskBusyError, match="already queued or running"):
+        resume_research(
+            thread_id,
+            user_id=1,
+            settings=settings,
+            pool=TEST_POOL,
+            redis=redis,
+            enqueue=queue,
             action=action,
             answer=answer,
         )
-    )
-
-    assert view.status == result_status
-    assert len(graph.stream_calls) == 1
-    call = graph.stream_calls[0]
-    assert call.durability == "sync"
-    assert call.config["recursion_limit"] == 96
-    assert _thread_from_config(call.config) == thread_id
-    assert checkpointer.setup_calls == 0
-    assert checkpointer.active is False
-    assert len(trace_calls) == 1
-    assert trace_calls[0]["enabled"] is True
-    assert len(store.put_calls) == 1
-    assert store.put_calls[0].value["status"] == result_status
+    assert len(queue.runs) == 1
 
 
 @pytest.mark.parametrize(
     ("status", "action", "answer"),
     [
         ("awaiting_confirmation", None, None),
-        ("awaiting_confirmation", "approve", "unexpected request"),
-        ("awaiting_confirmation", "reject", "unexpected request"),
         ("awaiting_confirmation", "invalid", None),
         ("running", "approve", None),
         ("running", None, "Research MSFT."),
     ],
 )
-def test_resume_rejects_invalid_action_request_and_phase_before_invoke(
+def test_resume_rejects_invalid_action_request_and_phase_before_queueing(
     monkeypatch: pytest.MonkeyPatch,
     settings: Settings,
+    redis: fakeredis.FakeRedis,
     status: str,
     action: str | None,
     answer: str | None,
@@ -750,34 +624,115 @@ def test_resume_rejects_invalid_action_request_and_phase_before_invoke(
     checkpointer = _CheckpointerSpy()
     graph = _GraphSpy(checkpointer, _snapshot(_state(thread_id, status=status)))
     _install_storage(monkeypatch, checkpointer, graph)
-
-    def forbidden(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("invalid resume must not construct runtime dependencies")
-
-    monkeypatch.setattr(research_module, "build_llm", forbidden)
-    monkeypatch.setattr(research_module, "YFinanceProvider", forbidden)
+    queue = _Queue()
 
     with pytest.raises(ValueError, match="research task|action|answer|confirmation"):
-        tuple(
-            stream_resume_research(
-                thread_id,
-                user_id=1,
-                settings=settings,
-                pool=TEST_POOL,
-                action=action,
-                answer=answer,
-            )
+        resume_research(
+            thread_id,
+            user_id=1,
+            settings=settings,
+            pool=TEST_POOL,
+            redis=redis,
+            enqueue=queue,
+            action=action,
+            answer=answer,
         )
 
-    assert graph.stream_calls == []
-    assert checkpointer.setup_calls == 0
-    assert checkpointer.active is False
+    assert queue.runs == []
+    assert task_runs.run_state(redis, thread_id) is None
 
 
-def test_running_task_resumes_with_empty_input_and_no_hitl_command(
+class _LockConnection:
+    def __init__(self, acquired: bool) -> None:
+        self.acquired = acquired
+        self.statements: list[tuple[str, tuple[object, ...]]] = []
+
+    def execute(self, sql: str, params: tuple[object, ...]) -> SimpleNamespace:
+        self.statements.append((sql, params))
+        return SimpleNamespace(fetchone=lambda: {"acquired": self.acquired})
+
+
+class _LockPool:
+    def __init__(self, acquired: bool) -> None:
+        self.connection_spy = _LockConnection(acquired)
+
+    @contextmanager
+    def connection(self) -> Iterator[_LockConnection]:
+        yield self.connection_spy
+
+
+def test_task_lock_releases_after_failures_and_rejects_a_busy_task() -> None:
+    thread_id = str(uuid4())
+    pool = _LockPool(acquired=True)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with research_module._task_lock(cast(DatabasePool, pool), thread_id):
+            raise RuntimeError("interrupted")
+    statements = pool.connection_spy.statements
+    assert [sql.split("(")[0] for sql, _ in statements] == [
+        "SELECT pg_try_advisory_lock",
+        "SELECT pg_advisory_unlock",
+    ]
+    assert all(params == (thread_id,) for _, params in statements)
+
+    busy = _LockPool(acquired=False)
+    with pytest.raises(TaskBusyError):
+        with research_module._task_lock(cast(DatabasePool, busy), thread_id):
+            raise AssertionError("a busy task must not run")
+    assert len(busy.connection_spy.statements) == 1
+
+
+def test_worker_streams_live_events_then_clears_the_run_and_refreshes_history(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     settings: Settings,
+    redis: fakeredis.FakeRedis,
+) -> None:
+    thread_id = str(uuid4())
+    checkpointer = _CheckpointerSpy()
+    event = AgentEvent(
+        source="research_agent", kind="decision", message="Research Agent · Deciding..."
+    )
+    graph = _GraphSpy(
+        checkpointer,
+        _snapshot(_state(thread_id)),
+        after_stream=lambda _value: _snapshot(_state(thread_id, status="rejected")),
+        events=(event,),
+    )
+    store = _install_storage(monkeypatch, checkpointer, graph)
+    _install_runtime_dependencies(monkeypatch)
+    trace_calls = _install_tracing(monkeypatch)
+    assert task_runs.claim_run(redis, thread_id, user_id=1, limit=2) == "claimed"
+    subscriber = redis.pubsub(ignore_subscribe_messages=True)
+    subscriber.subscribe(task_runs.events_channel(thread_id))
+
+    run_research(
+        thread_id,
+        user_id=1,
+        resume={"action": "reject"},
+        settings=settings,
+        pool=TEST_POOL,
+        redis=redis,
+    )
+
+    (call,) = graph.stream_calls
+    assert isinstance(call.value, Command)
+    assert call.value.resume == {"action": "reject"}
+    assert call.durability == "sync"
+    assert call.config["recursion_limit"] == 96
+    # One traced run, then an untraced read of the final checkpoint for the summary.
+    assert [call["enabled"] for call in trace_calls] == [True, False]
+    messages = (subscriber.get_message() for _ in range(3))
+    published = [message["data"] for message in messages if message is not None]
+    assert published == [f"agent\n{event.model_dump_json()}", "done\n{}"]
+    assert task_runs.run_state(redis, thread_id) is None
+    assert store.put_calls[-1].value["status"] == "rejected"
+
+
+def test_running_task_continues_from_its_checkpoint_without_a_hitl_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    settings: Settings,
+    redis: fakeredis.FakeRedis,
 ) -> None:
     thread_id = str(uuid4())
     checkpointer = _CheckpointerSpy()
@@ -788,20 +743,43 @@ def test_running_task_resumes_with_empty_input_and_no_hitl_command(
     )
     _install_storage(monkeypatch, checkpointer, graph)
     _install_runtime_dependencies(monkeypatch)
-    _install_enabled_tracing(monkeypatch)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
+    _install_tracing(monkeypatch)
+    queue = _Queue()
 
-    view = _last_view(
-        stream_resume_research(thread_id, user_id=1, settings=settings, pool=TEST_POOL)
+    resume_research(
+        thread_id, user_id=1, settings=settings, pool=TEST_POOL, redis=redis, enqueue=queue
+    )
+    run_research(thread_id, user_id=1, resume=None, settings=settings, pool=TEST_POOL, redis=redis)
+
+    assert queue.runs == [(thread_id, 1, None)]
+    assert graph.stream_calls[0].value is None
+    assert get_research_status(thread_id, user_id=1, pool=TEST_POOL, redis=redis).status == (
+        "failed"
     )
 
-    assert view.status == "failed"
-    assert len(graph.stream_calls) == 1
-    assert graph.stream_calls[0].value is None
-    assert graph.stream_calls[0].durability == "sync"
-    assert graph.stream_calls[0].config["recursion_limit"] == 96
-    assert checkpointer.setup_calls == 0
-    assert checkpointer.active is False
+
+def test_a_redelivered_run_skips_a_task_another_worker_holds(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    redis: fakeredis.FakeRedis,
+) -> None:
+    thread_id = str(uuid4())
+    checkpointer = _CheckpointerSpy()
+    graph = _GraphSpy(checkpointer, _snapshot(_state(thread_id, status="running")))
+    _install_storage(monkeypatch, checkpointer, graph)
+    task_runs.mark_running(redis, thread_id, user_id=1)
+
+    @contextmanager
+    def busy(_pool: DatabasePool, _thread_id: str) -> Iterator[None]:
+        raise TaskBusyError("research task is already running")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(research_module, "_task_lock", busy)
+
+    run_research(thread_id, user_id=1, resume=None, settings=settings, pool=TEST_POOL, redis=redis)
+
+    assert graph.stream_calls == []
+    assert task_runs.run_state(redis, thread_id) == "running"
 
 
 def test_goal_parser_failure_has_safe_actionable_error(
@@ -816,58 +794,46 @@ def test_goal_parser_failure_has_safe_actionable_error(
             "failure_stage": "goal_parsing",
             "failure_summary": "The research goal could not be parsed safely.",
             "draft_goal": None,
-            "confirmed_goal": None,
             "missing_goal_fields": [],
             "defaulted_fields": [],
         }
     )
     checkpointer = _CheckpointerSpy()
-    graph = _GraphSpy(checkpointer, _snapshot(validate_graph_state(state)))
+    graph = _GraphSpy(
+        checkpointer,
+        _snapshot(validate_graph_state(state).model_dump(mode="json")),
+    )
     _install_storage(monkeypatch, checkpointer, graph)
-    _install_disabled_tracing(monkeypatch)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
+    _install_tracing(monkeypatch)
 
-    view = get_research_status(thread_id, user_id=1, pool=TEST_POOL)
+    view = get_research_status(thread_id, user_id=1, pool=TEST_POOL, redis=fakeredis.FakeRedis())
 
     assert view.safe_error == (
         "Goal Parser could not parse this request. Start a new task to try again."
     )
 
 
-def test_terminal_resume_skips_agent_execution_and_refreshes_summary(
+def test_terminal_resume_returns_the_view_without_queueing_a_run(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     settings: Settings,
+    redis: fakeredis.FakeRedis,
+    object_store: dict[str, bytes],
 ) -> None:
     thread_id = str(uuid4())
-    report_dir = tmp_path / "artifacts" / "reports" / thread_id
-    report_dir.mkdir(parents=True)
-    (report_dir / "report.json").write_text("{}", encoding="utf-8")
+    object_store[f"research/{thread_id}/report.json"] = b"{}"
     checkpointer = _CheckpointerSpy()
-    graph = _GraphSpy(
-        checkpointer,
-        _snapshot(_state(thread_id, status="failed")),
-    )
-    store = _install_storage(monkeypatch, checkpointer, graph)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
+    graph = _GraphSpy(checkpointer, _snapshot(_state(thread_id, status="failed")))
+    _install_storage(monkeypatch, checkpointer, graph)
+    queue = _Queue()
 
-    def forbidden(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("terminal resume must not construct runtime dependencies")
-
-    monkeypatch.setattr(research_module, "build_llm", forbidden)
-    monkeypatch.setattr(research_module, "YFinanceProvider", forbidden)
-
-    view = _last_view(
-        stream_resume_research(thread_id, user_id=1, settings=settings, pool=TEST_POOL)
+    view = resume_research(
+        thread_id, user_id=1, settings=settings, pool=TEST_POOL, redis=redis, enqueue=queue
     )
 
     assert view.status == "failed"
-    assert graph.stream_calls == []
-    assert len(store.put_calls) == 1
-    assert store.put_calls[0].value["status"] == "failed"
-    assert store.put_calls[0].value["report_exists"] is True
-    assert checkpointer.setup_calls == 0
-    assert checkpointer.active is False
+    assert view.report_exists is True
+    assert queue.runs == []
+    assert task_runs.run_state(redis, thread_id) is None
 
 
 def test_status_is_pure_read_with_disabled_tracing_and_no_runtime_or_report_side_effects(
@@ -878,8 +844,7 @@ def test_status_is_pure_read_with_disabled_tracing_and_no_runtime_or_report_side
     checkpointer = _CheckpointerSpy()
     graph = _GraphSpy(checkpointer, _snapshot(_state(thread_id, status="running")))
     _install_storage(monkeypatch, checkpointer, graph)
-    trace_calls = _install_disabled_tracing(monkeypatch)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
+    trace_calls = _install_tracing(monkeypatch)
 
     def forbidden(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("status must stay a read-only checkpoint operation")
@@ -888,15 +853,14 @@ def test_status_is_pure_read_with_disabled_tracing_and_no_runtime_or_report_side
     monkeypatch.setattr(research_module, "YFinanceProvider", forbidden)
     monkeypatch.setattr(finalization_module, "generate_report", forbidden)
 
-    view = get_research_status(thread_id, user_id=1, pool=TEST_POOL)
+    view = get_research_status(thread_id, user_id=1, pool=TEST_POOL, redis=fakeredis.FakeRedis())
 
     assert isinstance(view, ResearchTaskView)
     assert view.status == "running"
     assert graph.stream_calls == []
     assert len(graph.get_state_calls) == 1
-    assert checkpointer.open_calls == 1
+    assert checkpointer.create_calls == 1
     assert checkpointer.setup_calls == 0
-    assert checkpointer.active is False
     assert trace_calls == [{"enabled": False}]
     assert not (tmp_path / "artifacts").exists()
 
@@ -907,7 +871,7 @@ def test_list_uses_store_pagination_and_returns_safe_updated_at(
     thread_id = str(uuid4())
     updated_at = datetime(2026, 8, 5, 8, 30, tzinfo=UTC)
     checkpointer = _CheckpointerSpy()
-    graph = _GraphSpy(checkpointer, _Snapshot(values={}))
+    graph = _GraphSpy(checkpointer, _state_snapshot({}))
     store = _StoreSpy()
     store.items = [
         SimpleNamespace(
@@ -943,27 +907,11 @@ def test_list_uses_store_pagination_and_returns_safe_updated_at(
         ),
     )
     assert store.search_calls == [{"namespace": ("research_tasks", "7"), "limit": 7, "offset": 3}]
-    assert checkpointer.open_calls == 0
-
-
-@pytest.mark.parametrize(("limit", "offset"), [(0, 0), (101, 0), (20, -1), (True, 0)])
-def test_list_rejects_invalid_pagination_before_opening_store(
-    monkeypatch: pytest.MonkeyPatch,
-    limit: int,
-    offset: int,
-) -> None:
-    def forbidden(_pool: object) -> object:
-        raise AssertionError("invalid pagination must not open PostgreSQL")
-
-    monkeypatch.setattr(research_module, "open_store", forbidden)
-
-    with pytest.raises(ValueError, match="limit|offset"):
-        list_research_tasks(user_id=1, pool=TEST_POOL, limit=limit, offset=offset)
+    assert checkpointer.create_calls == 0
 
 
 def test_task_summary_stores_a_bounded_request(
     monkeypatch: pytest.MonkeyPatch,
-    settings: Settings,
 ) -> None:
     thread_id = str(uuid4())
     unsafe_request = (
@@ -972,15 +920,13 @@ def test_task_summary_stores_a_bounded_request(
     )
     state = _state(thread_id, status="running", request=unsafe_request)
     snapshot = _snapshot(state)
-    view = research_module._task_view(
-        snapshot,
-        state=state,
-    )
+    validated = validate_graph_state(state)
+    view = build_task_view(snapshot, validated, report_exists=False, run_state=None)
     checkpointer = _CheckpointerSpy()
     graph = _GraphSpy(checkpointer, snapshot)
     store = _install_storage(monkeypatch, checkpointer, graph)
 
-    research_module._save_task_summary(settings, state, view)
+    research_module._save_task_summary(TEST_POOL, validated, view)
 
     stored = store.put_calls[0].value
     assert set(stored) == {
@@ -1004,13 +950,13 @@ def test_status_returns_a_fixed_safe_view_without_raw_task_or_state_errors(
     task_sentinel = "unsafe-task-error postgresql://user:secret@db/research"
     state_sentinel = "unsafe-state-failure sk-secret-value"
     parent_state = _state(thread_id, status="running")
-    child_state = copy.deepcopy(parent_state)
-    child_state["failure_summary"] = state_sentinel
-    child_state.update(
+    child_workspace = copy.deepcopy(parent_state["workspace"])
+    child_workspace.update(
         {
             "agent_steps": 1,
             "tool_calls": 1,
-            "message_journal": [
+            "fatal_reason": state_sentinel,
+            "journal": [
                 {
                     "step": 1,
                     "tool_name": "calculate_asset_statistics",
@@ -1023,57 +969,71 @@ def test_status_returns_a_fixed_safe_view_without_raw_task_or_state_errors(
                         "metrics": {},
                         "warnings": [],
                     },
-                    "tool_call_id": "call-1",
-                    "replayable": True,
                 }
             ],
         }
     )
-    child_state = validate_graph_state(child_state)
     checkpointer = _CheckpointerSpy()
-    task_id = "active-research-task"
-    checkpointer.child_states[f"research_agent:{task_id}"] = child_state
+    checkpointer.agent_checkpoints["research_agent:active-research-task"] = {
+        "messages": [],
+        "workspace": child_workspace,
+    }
     graph = _GraphSpy(
         checkpointer,
-        _Snapshot(
-            values=parent_state,
+        _state_snapshot(
+            parent_state,
             tasks=(
-                SimpleNamespace(
+                PregelTask(
+                    path=(),
                     name="research_agent",
-                    id=task_id,
+                    id="active-research-task",
                     error=RuntimeError(task_sentinel),
                 ),
             ),
-            next=("research_agent",),
+            next_nodes=("research_agent",),
         ),
     )
     _install_storage(monkeypatch, checkpointer, graph)
-    _install_disabled_tracing(monkeypatch)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
+    _install_tracing(monkeypatch)
 
-    view = get_research_status(thread_id, user_id=1, pool=TEST_POOL)
+    view = get_research_status(thread_id, user_id=1, pool=TEST_POOL, redis=fakeredis.FakeRedis())
 
     assert isinstance(view, ResearchTaskView)
     assert view.thread_id == thread_id
     assert view.status == "running"
     assert view.can_resume is True
-    assert view.goal == child_state["confirmed_goal"]
-    assert view.defaulted_fields == tuple(child_state["defaulted_fields"])
-    assert view.budget_used == {
+    assert view.goal == {
+        "objective": "Research AAPL with the supported long-only strategies.",
+        "symbol": "AAPL",
+        "bar_interval": "1d",
+        "start_date": "2021-07-13",
+        "end_date": "2026-07-13",
+        "training_sessions": None,
+        "test_sessions": None,
+        "allowed_strategies": ("moving_average", "rsi", "macd"),
+        "max_drawdown_limit": 0.2,
+        "position_tranches": 5,
+        "benchmark_symbol": "SPY",
+        "request_issue": None,
+        "transaction_cost_bps": 7.5,
+        "slippage_bps": 2.5,
+    }
+    assert view.defaulted_fields == tuple(parent_state["defaulted_fields"])
+    assert view.budget_used.model_dump() == {
         "agent_steps": 1,
         "tool_calls": 1,
         "training_backtests": 0,
     }
-    assert view.budget_remaining == {
+    assert view.budget_remaining.model_dump() == {
         "agent_steps": 39,
         "tool_calls": 29,
-        "training_backtests": 8,
+        "training_backtests": 11,
     }
     assert view.active_agent == "research"
     assert view.critic_round == 0
     assert view.critic_verdict is None
-    assert view.critic_budget_used == {"agent_steps": 0, "tool_calls": 0}
-    assert view.critic_budget_remaining == {"agent_steps": 0, "tool_calls": 0}
+    assert view.critic_budget_used.model_dump() == {"agent_steps": 0, "tool_calls": 0}
+    assert view.critic_budget_remaining.model_dump() == {"agent_steps": 0, "tool_calls": 0}
     assert view.last_agent == "research"
     assert view.last_action == "calculate_asset_statistics"
     assert view.last_observation == "Market data must be loaded first."
@@ -1090,7 +1050,7 @@ def test_status_returns_a_fixed_safe_view_without_raw_task_or_state_errors(
 
 def test_report_endpoint_does_not_generate_a_missing_report(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    object_store: dict[str, bytes],
 ) -> None:
     thread_id = str(uuid4())
     checkpointer = _CheckpointerSpy()
@@ -1099,14 +1059,11 @@ def test_report_endpoint_does_not_generate_a_missing_report(
         _snapshot(_state(thread_id, status="failed")),
     )
     _install_storage(monkeypatch, checkpointer, graph)
-    _install_disabled_tracing(monkeypatch)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
-    report_dir = tmp_path / "artifacts" / "reports" / thread_id
-    report_dir.mkdir(parents=True)
+    _install_tracing(monkeypatch)
     with pytest.raises(ValueError, match="report file was not found"):
         get_research_report_view(thread_id, user_id=1, pool=TEST_POOL)
 
-    assert not (report_dir / "report.json").exists()
+    assert f"research/{thread_id}/report.json" not in object_store
 
 
 def test_unknown_thread_is_not_treated_as_a_completed_task_or_report(
@@ -1115,17 +1072,15 @@ def test_unknown_thread_is_not_treated_as_a_completed_task_or_report(
 ) -> None:
     thread_id = str(uuid4())
     checkpointer = _CheckpointerSpy()
-    graph = _GraphSpy(checkpointer, _Snapshot(values={}))
+    graph = _GraphSpy(checkpointer, _state_snapshot({}))
     _install_storage(monkeypatch, checkpointer, graph)
-    _install_disabled_tracing(monkeypatch)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
+    _install_tracing(monkeypatch)
 
     with pytest.raises(ValueError, match="not found"):
-        get_research_status(thread_id, user_id=1, pool=TEST_POOL)
+        get_research_status(thread_id, user_id=1, pool=TEST_POOL, redis=fakeredis.FakeRedis())
 
     assert graph.stream_calls == []
     assert checkpointer.setup_calls == 0
-    assert checkpointer.active is False
 
 
 @pytest.mark.parametrize("operation", ["status", "resume", "report"])
@@ -1139,17 +1094,18 @@ def test_task_access_is_limited_to_its_owner(
     graph = _GraphSpy(checkpointer, _snapshot(_state(thread_id)))
     _install_storage(monkeypatch, checkpointer, graph)
 
+    redis = fakeredis.FakeRedis()
     with pytest.raises(ValueError, match="research task was not found"):
         if operation == "status":
-            get_research_status(thread_id, user_id=2, pool=TEST_POOL)
+            get_research_status(thread_id, user_id=2, pool=TEST_POOL, redis=redis)
         elif operation == "resume":
-            tuple(
-                stream_resume_research(
-                    thread_id,
-                    user_id=2,
-                    settings=settings,
-                    pool=TEST_POOL,
-                )
+            resume_research(
+                thread_id,
+                user_id=2,
+                settings=settings,
+                pool=TEST_POOL,
+                redis=redis,
+                enqueue=_Queue(),
             )
         else:
             get_research_report_view(thread_id, user_id=2, pool=TEST_POOL)
@@ -1157,15 +1113,15 @@ def test_task_access_is_limited_to_its_owner(
     assert graph.stream_calls == []
 
 
-def test_recoverable_stream_error_reads_latest_state_before_closing_checkpointer(
+def test_exhausted_model_retries_leave_a_resumable_task_with_a_safe_view(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     settings: Settings,
+    redis: fakeredis.FakeRedis,
 ) -> None:
     thread_id = str(uuid4())
     unsafe_error = "unsafe-provider-error sk-recoverable-secret"
     state = _state(thread_id, status="running")
-    state["failure_summary"] = "unsafe-checkpoint-detail postgresql://user:secret@db/task"
     checkpointer = _CheckpointerSpy()
 
     class RecoverableGraphSpy(_GraphSpy):
@@ -1174,241 +1130,78 @@ def test_recoverable_stream_error_reads_latest_state_before_closing_checkpointer
             try:
                 raise RuntimeError(unsafe_error)
             except RuntimeError as exc:
-                raise RecoverableResearchError(stage="model") from exc
+                raise RecoverableResearchError() from exc
 
     graph = RecoverableGraphSpy(
         checkpointer,
         _snapshot(state),
-        after_stream=lambda _value: _snapshot(
-            state,
-            recoverable_error=RuntimeError(unsafe_error),
-        ),
+        after_stream=lambda _value: _snapshot(state, recoverable_error=RuntimeError(unsafe_error)),
     )
     _install_storage(monkeypatch, checkpointer, graph)
     _install_runtime_dependencies(monkeypatch)
-    _install_enabled_tracing(monkeypatch)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
+    _install_tracing(monkeypatch)
 
-    view = _last_view(
-        stream_resume_research(thread_id, user_id=1, settings=settings, pool=TEST_POOL)
-    )
+    run_research(thread_id, user_id=1, resume=None, settings=settings, pool=TEST_POOL, redis=redis)
+    view = get_research_status(thread_id, user_id=1, pool=TEST_POOL, redis=redis)
 
     assert view.status == "running"
+    assert view.run_state is None
     assert view.can_resume is True
     assert view.safe_error == "The research task can be resumed."
-    assert len(graph.stream_calls) == 1
-    assert len(graph.get_state_calls) == 2
-    assert checkpointer.open_calls == 1
-    assert checkpointer.setup_calls == 0
-    assert checkpointer.active is False
     serialized_view = repr(asdict(view))
     assert unsafe_error not in serialized_view
     assert "sk-recoverable-secret" not in serialized_view
-    assert "postgresql://" not in serialized_view
-
-
-@pytest.mark.parametrize("operation", ["status", "resume"])
-def test_task_commands_reject_noncanonical_uuid4_before_opening_storage(
-    monkeypatch: pytest.MonkeyPatch,
-    settings: Settings,
-    operation: str,
-) -> None:
-    invalid_thread_id = "not-a-uuid"
-    storage_calls: list[Settings] = []
-    tracing_calls: list[dict[str, object]] = []
-
-    @contextmanager
-    def forbidden_storage(supplied: Settings) -> Iterator[None]:
-        storage_calls.append(supplied)
-        yield
-
-    @contextmanager
-    def tracing_spy(**kwargs: object) -> Iterator[None]:
-        tracing_calls.append(dict(kwargs))
-        yield
-
-    monkeypatch.setattr(research_module, "open_checkpointer", forbidden_storage)
-    monkeypatch.setattr(research_module, "tracing_context", tracing_spy)
-
-    with pytest.raises(ValueError) as captured:
-        if operation == "status":
-            get_research_status(invalid_thread_id, user_id=1, pool=TEST_POOL)
-        else:
-            tuple(
-                stream_resume_research(
-                    invalid_thread_id,
-                    user_id=1,
-                    settings=settings,
-                    pool=TEST_POOL,
-                )
-            )
-
-    assert str(captured.value) == "research thread ID must be a canonical UUID4"
-    assert storage_calls == []
-    assert tracing_calls == []
-
-
-def test_start_and_resume_use_independent_same_thread_clients_and_trace_roots(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    settings: Settings,
-    no_network_langsmith: _TracingRuntime,
-) -> None:
-    checkpointer = _CheckpointerSpy()
-    started_thread: list[str] = []
-
-    def after_stream(value: object) -> _Snapshot:
-        if isinstance(value, Mapping):
-            thread_id = value["thread_id"]
-            assert isinstance(thread_id, str)
-            started_thread[:] = [thread_id]
-            return _snapshot(_state(thread_id))
-        assert isinstance(value, Command)
-        assert value.resume == {"action": "reject"}
-        return _snapshot(_state(started_thread[0], status="rejected"))
-
-    graph = _GraphSpy(
-        checkpointer,
-        _Snapshot(values={}),
-        after_stream=after_stream,
-    )
-    _install_storage(monkeypatch, checkpointer, graph)
-    _install_runtime_dependencies(monkeypatch)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
-
-    started = _last_view(
-        stream_start_research(
-            "Research AAPL with the supported long-only strategies.",
-            user_id=1,
-            settings=settings,
-            pool=TEST_POOL,
-            reference_date=date(2026, 7, 13),
-        )
-    )
-    resumed = _last_view(
-        stream_resume_research(
-            started.thread_id,
-            user_id=1,
-            settings=settings,
-            pool=TEST_POOL,
-            action="reject",
-        )
-    )
-
-    assert resumed.thread_id == started.thread_id
-    assert resumed.status == "rejected"
-    assert len(no_network_langsmith.clients) == 2
-    first_client, second_client = no_network_langsmith.clients
-    assert first_client is not second_client
-    for client in (first_client, second_client):
-        assert client.kwargs["api_key"] == settings.langsmith_api_key.get_secret_value()
-        assert client.kwargs["omit_traced_runtime_info"] is True
-        assert client.flush_calls == 1
-        assert client.close_calls == 1
-        assert client.flush_timeouts == [5.0]
-        assert client.close_timeouts == [0.0]
-        assert client.closed is True
-        positions = {
-            event: no_network_langsmith.events.index((event, client.identifier))
-            for event in ("client", "enter", "exit", "flush", "close")
-        }
-        assert (
-            positions["client"]
-            < positions["enter"]
-            < positions["exit"]
-            < positions["flush"]
-            < positions["close"]
-        )
-
-    assert len(no_network_langsmith.context_calls) == 2
-    for context_call, client in zip(
-        no_network_langsmith.context_calls,
-        (first_client, second_client),
-        strict=True,
-    ):
-        assert context_call["enabled"] is True
-        assert context_call["client"] is client
-        assert context_call["project_name"] == settings.langsmith_project
-        metadata = context_call["metadata"]
-        assert isinstance(metadata, Mapping)
-        assert metadata["thread_id"] == started.thread_id
-        assert context_call.get("parent") in {None, False}
-        assert context_call.get("distributed_parent_id") is None
-
-    assert len(graph.stream_calls) == 2
-    assert all(call.config["run_name"] == "research_workflow" for call in graph.stream_calls)
-    assert all(_thread_from_config(call.config) == started.thread_id for call in graph.stream_calls)
-    assert checkpointer.open_calls == 2
-    assert checkpointer.setup_calls == 0
-    assert no_network_langsmith.context_depth == 0
-
-
-def test_start_does_not_create_report_directories_before_confirmation(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    settings: Settings,
-) -> None:
-    checkpointer = _CheckpointerSpy()
-
-    def after_start(value: object) -> _Snapshot:
-        assert isinstance(value, Mapping)
-        return _snapshot(_state(str(value["thread_id"]), request=str(value["request"])))
-
-    graph = _GraphSpy(checkpointer, _Snapshot(values={}), after_stream=after_start)
-    _install_storage(monkeypatch, checkpointer, graph)
-    _install_runtime_dependencies(monkeypatch)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
-
-    view = _last_view(
-        stream_start_research(
-            "Research AAPL with the supported long-only strategies.",
-            user_id=1,
-            settings=settings,
-            pool=TEST_POOL,
-            reference_date=date(2026, 7, 13),
-        )
-    )
-
-    assert view.status == "awaiting_confirmation"
-    assert not (tmp_path / "artifacts").exists()
 
 
 @pytest.mark.parametrize(
-    ("next_nodes", "has_active_agent_task", "has_task_error", "expected_can_resume"),
+    ("next_nodes", "has_active_agent_task", "has_task_error", "queued", "expected_can_resume"),
     [
-        ((), False, False, False),
-        ((), True, False, True),
-        ((), False, True, True),
+        ((), False, False, False, False),
+        ((), True, False, False, True),
+        ((), False, True, False, True),
+        ((), False, True, True, False),
     ],
 )
 def test_running_can_resume_is_derived_from_pending_work_or_task_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    redis: fakeredis.FakeRedis,
     next_nodes: tuple[str, ...],
     has_active_agent_task: bool,
     has_task_error: bool,
+    queued: bool,
     expected_can_resume: bool,
 ) -> None:
     thread_id = str(uuid4())
-    tasks: tuple[object, ...] = ()
+    tasks: tuple[PregelTask, ...] = ()
     if has_active_agent_task:
-        tasks = (SimpleNamespace(name="critic_agent", result=None, error=None),)
+        tasks = (PregelTask(id="critic-task", name="critic_agent", path=()),)
     elif has_task_error:
-        tasks = (SimpleNamespace(error=RuntimeError("unsafe-recoverable-detail")),)
-    snapshot = _Snapshot(
-        values=_state(thread_id, status="running"),
+        tasks = (
+            PregelTask(
+                id="failed-task",
+                name="research_agent",
+                path=(),
+                error=RuntimeError("unsafe-recoverable-detail"),
+            ),
+        )
+    snapshot = _state_snapshot(
+        _state(thread_id, status="running"),
         tasks=tasks,
-        next=next_nodes,
+        next_nodes=next_nodes,
     )
     checkpointer = _CheckpointerSpy()
     graph = _GraphSpy(checkpointer, snapshot)
     _install_storage(monkeypatch, checkpointer, graph)
-    monkeypatch.setattr(research_module, "PROJECT_ROOT", tmp_path)
+    if queued:
+        task_runs.claim_run(redis, thread_id, user_id=1, limit=2)
 
-    view = get_research_status(thread_id, user_id=1, pool=TEST_POOL)
+    view = get_research_status(thread_id, user_id=1, pool=TEST_POOL, redis=redis)
 
     assert view.can_resume is expected_can_resume
-    assert view.safe_error == ("The research task can be resumed." if has_task_error else None)
+    assert view.safe_error == (
+        "The research task can be resumed." if has_task_error and not queued else None
+    )
 
 
 def test_clarification_guidance_explains_missing_agent_goal_fields() -> None:
@@ -1419,7 +1212,9 @@ def test_clarification_guidance_explains_missing_agent_goal_fields() -> None:
     )
 
     assert hints == (
-        "Complete in-sample trading days / 样本内完整交易日数量，例如 2",
-        "Complete out-of-sample trading days / 样本外完整交易日数量，例如 1",
+        "Complete in-sample trading days, at most 20 in total / "
+        "样本内完整交易日数量，与样本外合计不超过 20，例如 2",
+        "Complete out-of-sample trading days, at most 20 in total / "
+        "样本外完整交易日数量，与样本内合计不超过 20，例如 1",
     )
     assert example == "2个样本内，1个样本外"

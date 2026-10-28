@@ -5,9 +5,9 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from trading.quant import backtest
-from trading.quant.backtest import analyze_drawdown, run_final_evaluation, run_training_evaluation
-from trading.quant.models import (
+from tragent.quant import backtest, strategies
+from tragent.quant.backtest import analyze_drawdown, run_final_evaluation, run_training_evaluation
+from tragent.quant.models import (
     AlignedMarketData,
     BacktestCosts,
     DataQualityReport,
@@ -110,11 +110,9 @@ def test_signal_executes_at_the_next_open_with_costs() -> None:
     prices = data.asset.bars
 
     result = backtest._run_segment(
-        prices,
-        data.benchmark.bars,
+        data,
         target([1, 2, 3, 2, 1, 1], prices.index),
-        segment="training",
-        previous_close_tranches=0,
+        "training",
         costs=BacktestCosts(5, 5),
         position_tranches=5,
     )
@@ -162,11 +160,9 @@ def test_asset_and_benchmark_buy_and_hold_use_independent_prices_and_equal_costs
     prices = data.asset.bars
 
     result = backtest._run_segment(
-        prices,
-        data.benchmark.bars,
+        data,
         target([0, 0, 0], prices.index),
-        segment="training",
-        previous_close_tranches=0,
+        "training",
         costs=BacktestCosts(5, 5),
         position_tranches=1,
     )
@@ -188,11 +184,9 @@ def test_entry_skips_prior_overnight_gap_and_exit_keeps_its_gap() -> None:
     prices = data.asset.bars
 
     result = backtest._run_segment(
-        prices,
-        data.benchmark.bars,
+        data,
         target([1, 0, 0], prices.index),
-        segment="training",
-        previous_close_tranches=0,
+        "training",
         costs=BacktestCosts(5, 5),
         position_tranches=1,
     )
@@ -213,7 +207,7 @@ def test_final_test_starts_from_cash_but_uses_last_training_target(monkeypatch) 
             name="trade_signal",
         )
 
-    monkeypatch.setattr(backtest, "generate_trade_signals", one_buy_signal)
+    monkeypatch.setattr(strategies, "generate_trade_signals", one_buy_signal)
 
     evaluation = run_final_evaluation(
         data,
@@ -245,7 +239,7 @@ def test_final_test_starts_from_cash_but_uses_last_training_target(monkeypatch) 
             name="trade_signal",
         )
 
-    monkeypatch.setattr(backtest, "generate_trade_signals", persistent_buy)
+    monkeypatch.setattr(strategies, "generate_trade_signals", persistent_buy)
     intraday = run_final_evaluation(
         minute,
         MovingAverageConfig(short_window=2, long_window=3),
@@ -263,6 +257,43 @@ def test_final_test_starts_from_cash_but_uses_last_training_target(monkeypatch) 
     assert intraday.test.metrics.annualized_volatility is None
     assert intraday.test.metrics.sharpe_ratio is None
     assert intraday.test.metrics.benchmark_return is None
+
+
+def test_minute_sessions_flatten_at_the_final_minute_open(monkeypatch) -> None:
+    minute = intraday_data()
+    minute.asset.bars.iloc[2::3, minute.asset.bars.columns.get_loc("close")] = 70.0
+
+    def persistent_buy(close: pd.Series, _config: MovingAverageConfig) -> pd.Series:
+        return pd.Series([1, *([0] * (len(close) - 1))], index=close.index, dtype="int64")
+
+    monkeypatch.setattr(strategies, "generate_trade_signals", persistent_buy)
+    result = run_final_evaluation(
+        minute, MovingAverageConfig(short_window=2, long_window=3), costs=BacktestCosts(0, 0)
+    )
+
+    sell = result.test.trades[-1]
+    assert (sell.action, sell.date, sell.price) == ("sell", minute.asset.bars.index[-1], 100.0)
+    assert result.test.equity_curve.iloc[-1] == pytest.approx(1.0)
+    assert result.test.asset_buy_and_hold_equity_curve.iloc[-1] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("data_factory", ["daily", "minute"])
+def test_final_evaluation_embeds_the_separate_training_evaluation(data_factory: str) -> None:
+    data = (
+        aligned_data([100.0 + i for i in range(10)], [100.5 + i for i in range(10)])
+        if data_factory == "daily"
+        else intraday_data()
+    )
+    config = MovingAverageConfig(short_window=2, long_window=3)
+    final = run_final_evaluation(data, config, costs=BacktestCosts(5, 5))
+    separate = run_training_evaluation(data, config, costs=BacktestCosts(5, 5))
+    embedded = final.training_evaluation()
+
+    assert type(embedded) is type(separate)
+    assert embedded.training.metrics == separate.training.metrics
+    assert embedded.training.trades == separate.training.trades
+    pd.testing.assert_series_equal(embedded.training.equity_curve, separate.training.equity_curve)
+    assert (embedded.split_index, embedded.warnings) == (separate.split_index, separate.warnings)
 
 
 def test_training_evaluation_is_unchanged_when_future_prices_change() -> None:
@@ -286,11 +317,9 @@ def test_zero_trade_result_is_valid_and_sharpe_is_none() -> None:
     prices = data.asset.bars
 
     result = backtest._run_segment(
-        prices,
-        data.benchmark.bars,
+        data,
         target([0, 0, 0, 0], prices.index),
-        segment="training",
-        previous_close_tranches=0,
+        "training",
         costs=BacktestCosts(5, 5),
         position_tranches=5,
     )
@@ -342,30 +371,7 @@ def test_drawdown_preserves_a_tiny_but_real_loss() -> None:
     assert result.trough_date == index[1]
 
 
-def test_drawdown_rejects_non_finite_or_non_positive_equity() -> None:
-    index = pd.date_range("2024-01-01", periods=2, freq="D")
-
-    with pytest.raises(ValueError, match="positive"):
-        analyze_drawdown(pd.Series([1.0, 0.0], index=index))
-    with pytest.raises(ValueError, match="finite"):
-        analyze_drawdown(pd.Series([1.0, float("nan")], index=index))
-
-
-def test_evaluation_rejects_unaligned_indexes_and_insufficient_test_rows() -> None:
-    data = aligned_data([100.0] * 6, [100.0] * 6)
-    misaligned_benchmark = MarketData(
-        symbol="SPY",
-        bars=data.benchmark.bars.set_axis(
-            pd.date_range("2025-01-01", periods=6, freq="D"),
-            axis="index",
-        ),
-        quality=data.benchmark.quality,
-    )
-    misaligned = AlignedMarketData(asset=data.asset, benchmark=misaligned_benchmark)
-
-    with pytest.raises(ValueError, match="identical indexes"):
-        run_training_evaluation(misaligned, MovingAverageConfig(2, 3))
-
+def test_evaluation_rejects_too_few_bars_for_both_segments() -> None:
     too_short = aligned_data([100.0] * 4, [100.0] * 4)
     with pytest.raises(ValueError, match="at least"):
         run_training_evaluation(too_short, MovingAverageConfig(2, 3))

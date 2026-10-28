@@ -1,28 +1,33 @@
-"""Durable workspace snapshot and deterministic rehydration behavior tests."""
+"""Durable workspace checkpoints rehydrate deterministically without provider access."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import date
-from pathlib import Path
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pandas as pd
 
-from trading.agent.models import AgentBudget, ResearchGoal, ToolObservation
-from trading.agent.runtime import (
+from tragent.quant import DataQualityReport, MarketData, MarketDataDownloadError
+from tragent.research.agent.market_snapshot import MARKET_DATA_FILENAME
+from tragent.research.agent.models import (
+    AgentBudget,
+    MarketContextEvidence,
+    ResearchGoal,
+    ToolObservation,
+)
+from tragent.research.agent.runtime import (
     calculate_asset_statistics,
     get_market_data,
     run_backtest,
 )
-from trading.agent.state import (
-    GraphState,
-    restore_workspace_from_state,
-    validate_graph_state,
-    workspace_to_state,
+from tragent.research.agent.state import GraphState, validate_graph_state
+from tragent.research.agent.workspace import (
+    ResearchGraphContext,
+    ResearchWorkspace,
+    record_tool_call,
 )
-from trading.agent.workspace import ResearchWorkspace, record_event
-from trading.quant import DataQualityReport, MarketData, MarketDataDownloadError
 
 _BAR_COLUMNS = ("open", "high", "low", "close", "volume")
 
@@ -101,56 +106,57 @@ def _market_data(symbol: str, *, scale: float) -> MarketData:
     )
 
 
-def _record_no_args(workspace: ResearchWorkspace, observation: ToolObservation) -> None:
-    _record(workspace, observation, arguments={})
+def bound(workspace: ResearchWorkspace, provider: object, artifacts: str) -> ResearchWorkspace:
+    return workspace.bind(
+        ResearchGraphContext(model=MagicMock(), provider=provider, artifacts=artifacts)
+    )
 
 
 def _record(
     workspace: ResearchWorkspace,
     observation: ToolObservation,
     *,
-    arguments: dict[str, object],
+    arguments: dict[str, object] | None = None,
 ) -> None:
     workspace.agent_steps += 1
     workspace.tool_calls += 1
-    record_event(
-        workspace,
+    record_tool_call(
+        workspace.journal,
+        step=workspace.agent_steps,
         tool_name=observation.tool_name,
-        normalized_arguments=arguments,
+        arguments=arguments or {},
         observation=observation,
-        tool_call_id=f"call-{workspace.agent_steps}",
-        replayable=True,
     )
 
 
 def _graph_state(workspace: ResearchWorkspace) -> GraphState:
     goal = workspace.goal
-    state: dict[str, object] = {
-        "thread_id": str(uuid4()),
-        "user_id": 1,
-        "request": goal.objective,
-        "reference_date": "2026-07-13",
-        "status": "running",
-        "failure_stage": None,
-        "confirmation_error": None,
-        "failure_summary": None,
-        "cost_defaults": {
-            "transaction_cost_bps": goal.costs.transaction_cost_bps,
-            "slippage_bps": goal.costs.slippage_bps,
-        },
-        "position_tranches_default": goal.position_tranches,
-        "draft_goal": None,
-        "confirmed_goal": goal.model_dump(mode="json"),
-        "missing_goal_fields": [],
-        "defaulted_fields": [],
-        "budget": workspace.budget.model_dump(mode="json"),
-    }
-    state.update(workspace_to_state(workspace))
-    return validate_graph_state(state)
+    return validate_graph_state(
+        {
+            "thread_id": str(uuid4()),
+            "user_id": 1,
+            "request": goal.objective,
+            "reference_date": "2026-07-13",
+            "status": "running",
+            "cost_defaults": {
+                "transaction_cost_bps": goal.costs.transaction_cost_bps,
+                "slippage_bps": goal.costs.slippage_bps,
+            },
+            "position_tranches_default": goal.position_tranches,
+            "budget": workspace.budget.model_dump(mode="json"),
+            "workspace": workspace.model_dump(mode="json"),
+        }
+    )
+
+
+def _restored(state: GraphState, provider: object, artifacts: str) -> ResearchWorkspace:
+    durable = validate_graph_state(state.model_dump(mode="json")).workspace
+    assert durable is not None
+    return bound(durable, provider, artifacts)
 
 
 def _workspace_with_complete_final_batch(
-    report_dir: Path,
+    artifacts: str,
 ) -> tuple[ResearchWorkspace, tuple[str, str]]:
     provider = FakeProvider(
         {
@@ -158,184 +164,121 @@ def _workspace_with_complete_final_batch(
             "SPY": _market_data("SPY", scale=2.0),
         }
     )
-    workspace = ResearchWorkspace(
-        goal=_goal(),
-        budget=AgentBudget(),
-        provider=provider,
-        output_dir=report_dir,
-    )
-
-    for operation in (
-        get_market_data,
-        calculate_asset_statistics,
-    ):
+    workspace = bound(ResearchWorkspace(goal=_goal(), budget=AgentBudget()), provider, artifacts)
+    for operation in (get_market_data, calculate_asset_statistics):
         observation = operation(workspace)
         assert observation.status == "success"
-        _record_no_args(workspace, observation)
+        _record(workspace, observation)
 
-    first = run_backtest(
-        workspace,
-        stage="training",
-        strategy_name="moving_average",
-        parameters={"short_window": 2, "long_window": 3},
-    )
-    second = run_backtest(
-        workspace,
-        stage="training",
-        strategy_name="moving_average",
-        parameters={"short_window": 3, "long_window": 5},
+    first, second = (
+        run_backtest(
+            workspace,
+            stage="training",
+            strategy_name="moving_average",
+            parameters=parameters,
+        )
+        for parameters in (
+            {"short_window": 2, "long_window": 3},
+            {"short_window": 3, "long_window": 5},
+        )
     )
     assert first.status == second.status == "success"
-    first_fingerprint = first.identifiers["fingerprint"]
-    second_fingerprint = second.identifiers["fingerprint"]
-
-    final = run_backtest(
-        workspace,
-        stage="final",
-        selected_fingerprint=first_fingerprint,
+    fingerprints = (first.identifiers["fingerprint"], second.identifiers["fingerprint"])
+    assert run_backtest(workspace, stage="final", selected_fingerprint=fingerprints[0]).status == (
+        "success"
     )
-    assert final.status == "success"
     workspace.runtime_warnings.append("A deterministic checkpoint warning.")
-    return workspace, (first_fingerprint, second_fingerprint)
+    return workspace, fingerprints
 
 
 def test_workspace_round_trip_restores_complete_quant_state_without_side_effects(
-    tmp_path: Path,
+    object_store: dict[str, bytes],
 ) -> None:
-    report_dir = tmp_path / str(uuid4())
-    source, fingerprints = _workspace_with_complete_final_batch(report_dir)
-    state = _graph_state(source)
+    artifacts = f"research/{uuid4()}"
+    source, fingerprints = _workspace_with_complete_final_batch(artifacts)
+    evidence = MarketContextEvidence(
+        id="sec-source-1",
+        source_type="official",
+        source="SEC",
+        title="10-Q",
+        excerpt="Bounded filing evidence.",
+        published_at="2024-02-01",
+        url="https://www.sec.gov/example",
+    )
+    _record(
+        source,
+        ToolObservation(tool_name="search_market_context", status="success", evidence=(evidence,)),
+        arguments={"query": "risks"},
+    )
     provider = NeverProvider()
 
-    _, restored = restore_workspace_from_state(state, provider=provider, output_dir=report_dir)
+    restored = _restored(_graph_state(source), provider, artifacts)
 
     assert provider.calls == 0
-    assert not report_dir.exists()
-    assert restored.goal == source.goal
-    assert restored.budget == source.budget
+    assert list(object_store) == [f"{artifacts}/{MARKET_DATA_FILENAME}"]
+    assert restored.model_dump(mode="json") == source.model_dump(mode="json")
     assert restored.phase == "locked"
     assert restored.locked_fingerprint == fingerprints[0]
     assert restored.final_batch_completed is True
-    assert restored.current_candidate == source.current_candidate
-    assert restored.validated_configs == source.validated_configs
-    assert restored.agent_steps == source.agent_steps
-    assert restored.tool_calls == source.tool_calls
-    assert restored.training_backtests == source.training_backtests
-    assert restored.download_failures == source.download_failures
-    assert restored.runtime_warnings == source.runtime_warnings
-    assert restored.unresolved_issues == source.unresolved_issues
-    assert restored.fatal_reason is None
-    assert restored.events == source.events
-    assert restored.trace == source.trace
-    assert restored.result is None
+    assert [candidate.fingerprint for candidate in restored.candidates] == list(fingerprints)
+    assert all(candidate.test is not None for candidate in restored.candidates)
+    assert restored.retrieved_evidence == {evidence.id: evidence}
 
-    assert restored.aligned_data is not None
-    assert source.aligned_data is not None
-    pd.testing.assert_frame_equal(
-        restored.aligned_data.asset.bars,
-        source.aligned_data.asset.bars,
-        check_freq=False,
-    )
-    pd.testing.assert_frame_equal(
-        restored.aligned_data.benchmark.bars,
-        source.aligned_data.benchmark.bars,
-        check_freq=False,
-    )
-    assert restored.aligned_data.asset.quality == source.aligned_data.asset.quality
-    assert restored.aligned_data.benchmark.quality == source.aligned_data.benchmark.quality
+    assert restored.aligned_data is not None and source.aligned_data is not None
+    for name in ("asset", "benchmark"):
+        pd.testing.assert_frame_equal(
+            getattr(restored.aligned_data, name).bars,
+            getattr(source.aligned_data, name).bars,
+            check_freq=False,
+        )
+        assert getattr(restored.aligned_data, name).quality == (
+            getattr(source.aligned_data, name).quality
+        )
     assert restored.aligned_data.warnings == source.aligned_data.warnings
 
-    assert set(restored.training_evaluations) == set(fingerprints)
-    assert set(restored.final_evaluations) == set(fingerprints)
-    for fingerprint in fingerprints:
-        restored_training = restored.training_evaluations[fingerprint]
-        source_training = source.training_evaluations[fingerprint]
-        assert restored_training.split_index == source_training.split_index
-        assert restored_training.split_date == source_training.split_date
-        assert restored_training.training.metrics == source_training.training.metrics
-        restored_final = restored.final_evaluations[fingerprint]
-        source_final = source.final_evaluations[fingerprint]
-        assert restored_final.training.metrics == source_final.training.metrics
-        assert restored_final.test.metrics == source_final.test.metrics
 
-
-def test_rehydrated_success_cache_keeps_idempotent_data_tools_side_effect_free(
-    tmp_path: Path,
-) -> None:
-    report_dir = tmp_path / str(uuid4())
-    source, _ = _workspace_with_complete_final_batch(report_dir)
-    state = _graph_state(source)
+def test_rehydrated_success_cache_keeps_idempotent_data_tools_side_effect_free() -> None:
+    artifacts = f"research/{uuid4()}"
+    source, _ = _workspace_with_complete_final_batch(artifacts)
     provider = NeverProvider()
-    _, restored = restore_workspace_from_state(state, provider=provider, output_dir=report_dir)
-    expected = dict(source.cached_observations)
-    counters_before = (
-        restored.agent_steps,
-        restored.tool_calls,
-        restored.training_backtests,
+    restored = _restored(_graph_state(source), provider, artifacts)
+    before = restored.model_dump(mode="json")
+
+    assert get_market_data(restored) == source.latest_success("get_market_data")
+    assert calculate_asset_statistics(restored) == source.latest_success(
+        "calculate_asset_statistics"
     )
-    events_before = list(restored.events)
-    trace_before = list(restored.trace)
-
-    assert restored.asset_statistics is None
-    actual = {
-        "get_market_data": get_market_data(restored),
-        "calculate_asset_statistics": calculate_asset_statistics(restored),
-    }
-
-    assert actual == expected
-    assert set(restored.cached_observations) == set(actual)
-    assert restored.asset_statistics is None
     assert provider.calls == 0
-    assert (
-        restored.agent_steps,
-        restored.tool_calls,
-        restored.training_backtests,
-    ) == counters_before
-    assert restored.events == events_before
-    assert restored.trace == trace_before
-    assert not report_dir.exists()
+    assert restored.model_dump(mode="json") == before
 
 
-def test_error_and_rejected_observations_are_not_cached_and_download_retry_is_restored(
-    tmp_path: Path,
-) -> None:
-    report_dir = tmp_path / str(uuid4())
+def test_error_and_rejected_observations_are_not_cached_and_download_retry_is_restored() -> None:
+    artifacts = f"research/{uuid4()}"
     first_provider = FakeProvider(
         {
             "AAPL": MarketDataDownloadError("first transient download failure"),
             "SPY": _market_data("SPY", scale=2.0),
         }
     )
-    source = ResearchWorkspace(
-        goal=_goal(),
-        budget=AgentBudget(),
-        provider=first_provider,
-        output_dir=report_dir,
-    )
+    source = bound(ResearchWorkspace(goal=_goal(), budget=AgentBudget()), first_provider, artifacts)
 
     first_download = get_market_data(source)
     rejected_statistics = calculate_asset_statistics(source)
     assert first_download.status == "error"
     assert rejected_statistics.status == "rejected"
     for observation in (first_download, rejected_statistics):
-        _record_no_args(source, observation)
+        _record(source, observation)
     assert source.download_failures == 1
-    assert source.cached_observations == {}
+    assert source.aligned_data is None
 
-    state = _graph_state(source)
     retry_provider = FakeProvider(
         {
             "AAPL": MarketDataDownloadError("second transient download failure"),
             "SPY": _market_data("SPY", scale=2.0),
         }
     )
-    _, restored = restore_workspace_from_state(
-        state,
-        provider=retry_provider,
-        output_dir=report_dir,
-    )
+    restored = _restored(_graph_state(source), retry_provider, artifacts)
 
-    assert restored.cached_observations == {}
     assert restored.download_failures == 1
     assert calculate_asset_statistics(restored).status == "rejected"
     second_download = get_market_data(restored)
@@ -343,6 +286,5 @@ def test_error_and_rejected_observations_are_not_cached_and_download_retry_is_re
     assert second_download.status == "error"
     assert restored.download_failures == 2
     assert restored.fatal_reason == "Market data download failed twice."
-    assert restored.unresolved_issues == ["Market data download failed twice."]
     assert [call[0] for call in retry_provider.calls] == ["AAPL"]
-    assert restored.cached_observations == {}
+    assert restored.aligned_data is None

@@ -1,0 +1,8 @@
+# Only the Python sources and migrations go into the image.
+*
+!pyproject.toml
+!README.md
+!alembic.ini
+!migrations
+!src
+**/__pycache__

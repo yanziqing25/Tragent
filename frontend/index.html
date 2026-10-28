@@ -1,15 +1,24 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
-    <meta charset="UTF-8">
-    <link rel="icon" href="/favicon.ico">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="theme-color" content="#0D111B">
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Tragent is an AI agent system for durable US-equity strategy research."
-    >
+      content="Strategy research on US stocks with a Research Agent and an independent Critic."
+    />
     <title>Tragent</title>
+    <script>
+      // Apply the saved theme before first paint; useDark keeps it in sync afterwards.
+      try {
+        const theme = localStorage.getItem('tragent.theme')
+        const dark =
+          theme === 'dark' ||
+          (theme !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches)
+        document.documentElement.classList.toggle('dark', dark)
+      } catch {}
+    </script>
   </head>
   <body>
     <div id="app"></div>

@@ -9,8 +9,10 @@ description = "Durable AI agent system for US equity strategy research"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "alembic",
     "langchain",
     "langchain-openai",
+    "langchain-text-splitters",
     "langgraph-checkpoint-postgres",
     "psycopg[binary,pool]",
     "pydantic-settings",
@@ -19,25 +21,35 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "PyJWT",
+    "beautifulsoup4",
+    "feedparser",
+    "edgartools",
+    "httpx",
+    "ib_async",
+    "docker",
+    "confluent-kafka",
+    "boto3",
+    "python-multipart",
+    "celery[redis]",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "fakeredis[lua]",
+    "httpx2",
     "pytest",
     "ruff",
-    "httpx",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
-addopts = "-q --capture=sys"
+addopts = "-q"
 testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "UP"]

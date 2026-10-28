@@ -1,79 +1,117 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { LoaderCircle } from '@lucide/vue'
 
-import { SESSION_EXPIRED_MESSAGE, useAuthStore } from '@/stores/auth'
+import BrandMark from '@/components/BrandMark.vue'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { errorMessage } from '@/lib/errors'
+import { useAuthStore } from '@/stores/auth'
 
 const auth = useAuthStore()
 const router = useRouter()
 const username = ref('')
 const password = ref('')
-const loading = ref(false)
-const error = ref<string | null>(auth.sessionExpired ? SESSION_EXPIRED_MESSAGE : null)
+const pending = ref(false)
+const error = ref<string | null>(null)
+const registering = ref(false)
+const title = computed(() => (registering.value ? 'Create an account' : 'Sign in'))
+
+const switchMode = () => {
+  registering.value = !registering.value
+  error.value = null
+}
 
 const submit = async () => {
   if (!username.value.trim() || !password.value) return
-  loading.value = true
+  pending.value = true
   error.value = null
   try {
-    await auth.signIn(username.value.trim(), password.value)
-    await router.replace({ name: 'research' })
+    const enter = registering.value ? auth.register : auth.signIn
+    await enter(username.value.trim(), password.value)
+    await router.replace({ name: 'account' })
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : 'Sign in failed.'
+    error.value = errorMessage(cause)
   } finally {
-    loading.value = false
+    pending.value = false
   }
 }
 </script>
 
 <template>
-  <v-container class="login-shell d-flex align-center py-10" max-width="1200">
-    <v-row align="center" class="w-100" justify="space-between">
-      <v-col cols="12" md="7">
-        <div class="login-hero pr-md-10">
-          <div class="page-eyebrow mb-5">Tragent · Agentic US equity research</div>
-          <h1 class="login-title mb-6">Research that can explain its next move.</h1>
-          <p class="page-copy mb-7">
-            Turn one natural-language goal into a durable Research Agent workflow, verified by a
-            separate Critic Agent before the final report.
-          </p>
-          <div class="d-flex flex-wrap ga-3">
-            <span class="feature-pill"><span class="feature-dot"></span>Durable checkpoints</span>
-            <span class="feature-pill"><span class="feature-dot"></span>Research → Critic</span>
-            <span class="feature-pill"><span class="feature-dot"></span>Resume at any time</span>
-          </div>
-        </div>
-      </v-col>
-      <v-col cols="12" md="5" lg="4">
-        <v-card class="login-card mt-8 mt-md-0">
-          <v-card-text class="pa-7 pa-sm-9">
-            <div class="section-kicker mb-3">Secure workspace</div>
-            <h2 class="section-title mb-2">Welcome back</h2>
-            <p class="text-medium-emphasis mb-7">Sign in to continue your Research Agent tasks.</p>
-            <v-alert v-if="error" class="mb-5" type="error" variant="tonal">{{ error }}</v-alert>
-            <v-form @submit.prevent="submit">
-              <v-text-field
-                v-model="username"
-                class="mb-2"
-                label="Username"
-                autocomplete="username"
-                required
-              />
-              <v-text-field
-                v-model="password"
-                class="mb-2"
-                label="Password"
-                type="password"
-                autocomplete="current-password"
-                required
-              />
-              <v-btn block color="primary" size="large" type="submit" :loading="loading">
-                Enter workspace
-              </v-btn>
-            </v-form>
-          </v-card-text>
-        </v-card>
-      </v-col>
-    </v-row>
-  </v-container>
+  <main
+    class="relative flex min-h-screen flex-col items-center gap-6 overflow-hidden bg-surface px-6 py-24"
+  >
+    <div
+      aria-hidden="true"
+      class="absolute inset-0 bg-[radial-gradient(var(--color-input)_1px,transparent_1px)] [mask-image:radial-gradient(ellipse_60%_55%_at_50%_40%,#000,transparent_75%)] bg-size-[22px_22px]"
+    />
+    <div class="relative flex animate-rise items-center gap-2.5 text-[17px] font-semibold">
+      <BrandMark class="size-6.5" />
+      Tragent
+    </div>
+
+    <form
+      class="relative flex w-full max-w-90 animate-rise flex-col gap-4 rounded-2xl border border-border bg-card p-6 shadow-[0_1px_2px_rgb(0_0_0/0.04),0_12px_32px_rgb(0_0_0/0.06)] [animation-delay:80ms]"
+      @submit.prevent="submit"
+    >
+      <div class="flex flex-col gap-1">
+        <h1 class="text-lg font-semibold">{{ title }}</h1>
+        <p class="text-muted-foreground">
+          {{
+            registering
+              ? 'Then link your IBKR paper account to trade.'
+              : 'Use your Tragent account, not your IBKR login.'
+          }}
+        </p>
+      </div>
+      <p
+        v-if="auth.sessionExpired && !error && !registering"
+        role="status"
+        class="rounded-lg bg-warning-soft px-3 py-2 text-[13px] text-warning-ink"
+      >
+        Your session expired. Sign in again to continue.
+      </p>
+      <p
+        v-if="error"
+        role="alert"
+        class="rounded-lg bg-destructive-soft px-3 py-2 text-[13px] text-destructive-ink"
+      >
+        {{ error }}
+      </p>
+      <label class="flex flex-col gap-1.5">
+        <span class="font-medium">Username</span>
+        <Input v-model="username" name="username" autocomplete="username" required />
+      </label>
+      <label class="flex flex-col gap-1.5">
+        <span class="font-medium">Password</span>
+        <Input
+          v-model="password"
+          name="password"
+          type="password"
+          :autocomplete="registering ? 'new-password' : 'current-password'"
+          required
+        />
+      </label>
+      <Button type="submit" size="lg" :disabled="pending">
+        <LoaderCircle v-if="pending" class="animate-spin" />
+        {{ title }}
+      </Button>
+      <button
+        type="button"
+        class="cursor-pointer text-[13px] text-muted-foreground hover:text-foreground"
+        @click="switchMode"
+      >
+        {{ registering ? 'Have an account? Sign in' : 'New here? Create an account' }}
+      </button>
+    </form>
+
+    <p
+      class="relative max-w-90 animate-rise text-center text-[13px] text-faint [animation-delay:160ms]"
+    >
+      Quant trading on US stocks through your own IBKR paper account, with AI research built in. Not
+      financial advice.
+    </p>
+  </main>
 </template>

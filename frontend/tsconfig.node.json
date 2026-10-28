@@ -9,9 +9,6 @@
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
 
-    // Include Node.js types and avoid accidentally including other `@types/*` packages.
-    "types": ["node"],
-
     // Disable emitting output during `vue-tsc --build`, which is used for type-checking only.
     "noEmit": true,
 

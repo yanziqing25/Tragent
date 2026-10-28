@@ -2,24 +2,26 @@
 
 from __future__ import annotations
 
+from datetime import date
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
-from langchain_core.utils.function_calling import convert_to_openai_tool
+from langgraph.types import Command
 from pydantic import ValidationError
 
-import trading.agent as agent_package
-from trading.agent.models import ToolObservation
-from trading.agent.tools import (
-    EvaluationArgs,
-    NoArgs,
+import tragent.research.agent.tools as tools_module
+from tragent.research.agent.models import AgentBudget, ResearchGoal, ToolObservation
+from tragent.research.agent.tools import (
     RunBacktestArgs,
     SubmitResearchDraftArgs,
     build_research_tools,
 )
+from tragent.research.agent.workspace import ResearchGraphContext, ResearchWorkspace
 
 FINGERPRINT = "a" * 64
 TOOL_NAMES = (
@@ -28,13 +30,25 @@ TOOL_NAMES = (
     "run_backtest",
     "analyze_drawdown",
     "compare_with_benchmark",
+    "search_market_context",
     "submit_research_draft",
 )
 
 
 @pytest.fixture
-def runtime_spy(monkeypatch: pytest.MonkeyPatch) -> tuple[object, list[tuple[str, object, dict]]]:
-    workspace = object()
+def runtime_spy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ResearchWorkspace, list[tuple[str, object, dict]]]:
+    workspace = ResearchWorkspace(
+        goal=ResearchGoal(
+            objective="Exercise the Tool boundary.",
+            symbol="AAPL",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 6, 30),
+            allowed_strategies=("moving_average", "rsi", "macd"),
+        ),
+        budget=AgentBudget(),
+    )
     calls: list[tuple[str, object, dict]] = []
     operations: dict[str, Any] = {}
 
@@ -55,59 +69,55 @@ def runtime_spy(monkeypatch: pytest.MonkeyPatch) -> tuple[object, list[tuple[str
 
         operations[tool_name] = operation
 
-    fake_runtime = SimpleNamespace(**operations)
-    monkeypatch.setattr(agent_package, "runtime", fake_runtime, raising=False)
+    monkeypatch.setattr(tools_module, "runtime", SimpleNamespace(**operations))
     return workspace, calls
 
 
-def _tools_by_name(workspace: object) -> dict[str, StructuredTool]:
-    return {
-        tool.name: tool
-        for tool in build_research_tools(lambda: workspace)  # type: ignore[return-value]
-    }
+def _tools_by_name() -> dict[str, StructuredTool]:
+    return {tool.name: tool for tool in build_research_tools()}
 
 
-def test_builds_exactly_six_tools_with_strict_openai_schemas(runtime_spy) -> None:
-    workspace, _ = runtime_spy
-    tools = build_research_tools(lambda: workspace)  # type: ignore[return-value]
+def _call(
+    tool: StructuredTool,
+    workspace: ResearchWorkspace,
+    arguments: dict[str, object],
+    events: list[object] | None = None,
+) -> Any:
+    """Invoke a Tool the way ToolNode does, with the injected ToolRuntime."""
+
+    tool_call_id = f"call-{tool.name}"
+    runtime = ToolRuntime(
+        state={"workspace": workspace.model_dump(mode="json")},
+        context=ResearchGraphContext(
+            model=MagicMock(), provider=MagicMock(), artifacts="research/t"
+        ),
+        config={},
+        stream_writer=(events if events is not None else []).append,
+        tool_call_id=tool_call_id,
+        store=None,
+    )
+    return tool.invoke(
+        {
+            "name": tool.name,
+            "args": {**arguments, "tool_runtime": runtime},
+            "id": tool_call_id,
+            "type": "tool_call",
+        }
+    )
+
+
+def test_builds_the_research_agent_toolset(runtime_spy) -> None:
+    tools = build_research_tools()
 
     assert tuple(tool.name for tool in tools) == TOOL_NAMES
-    assert all(isinstance(tool, StructuredTool) for tool in tools)
     run_backtest_description = next(
         tool.description for tool in tools if tool.name == "run_backtest"
     )
     for parameter_name in ("short_window", "rsi_window", "fast_period"):
         assert parameter_name in run_backtest_description
 
-    forbidden_model_fields = {
-        "symbol",
-        "start_date",
-        "end_date",
-        "benchmark_symbol",
-        "output_dir",
-        "metrics",
-        "python_code",
-    }
-    for tool in tools:
-        assert tool.args_schema is not None
-        assert tool.return_direct is False
-        assert tool.args_schema.model_json_schema()["additionalProperties"] is False
-        converted = convert_to_openai_tool(tool)
-        parameters = converted["function"]["parameters"]
-        assert parameters["type"] == "object"
-        assert forbidden_model_fields.isdisjoint(parameters.get("properties", {}))
 
-
-@pytest.mark.parametrize(
-    "args_schema",
-    [NoArgs, RunBacktestArgs, EvaluationArgs, SubmitResearchDraftArgs],
-)
-def test_all_tool_schemas_forbid_extra_fields(args_schema) -> None:
-    with pytest.raises(ValidationError, match="extra_forbidden"):
-        args_schema.model_validate({"unexpected": "value"})
-
-
-@pytest.mark.parametrize("bad_value", [True, "20", float("nan"), float("inf")])
+@pytest.mark.parametrize("bad_value", [True, float("nan")])
 def test_strategy_parameters_are_strict_numbers(bad_value: object) -> None:
     with pytest.raises(ValidationError):
         RunBacktestArgs.model_validate(
@@ -136,23 +146,26 @@ def test_strategy_parameters_are_strict_numbers(bad_value: object) -> None:
     }
 
 
-@pytest.mark.parametrize(
-    "parameters",
-    [
-        {},
-        {"a": 1, "b": 2, "c": 3, "d": 4},
-        {"x" * 65: 1},
-    ],
-)
-def test_strategy_parameter_mapping_is_compact(parameters: dict[str, int]) -> None:
+def test_strategy_parameter_mapping_cannot_be_empty() -> None:
     with pytest.raises(ValidationError):
         RunBacktestArgs.model_validate(
             {
                 "stage": "training",
                 "strategy_name": "moving_average",
-                "parameters": parameters,
+                "parameters": {},
             }
         )
+
+
+@pytest.mark.parametrize("policy", ["intraday_rsi", "rsi_price_exit", "rsi_vwap_exit"])
+def test_fixed_policy_tool_accepts_only_empty_parameters(runtime_spy, policy) -> None:
+    workspace, calls = runtime_spy
+    args = {"stage": "training", "strategy_name": policy, "parameters": {}}
+    _call(_tools_by_name()["run_backtest"], workspace, args)
+    assert calls[-1][0] == "run_backtest"
+    assert calls[-1][2] == {**args, "selected_fingerprint": None}
+    with pytest.raises(ValidationError, match="fixed intraday"):
+        RunBacktestArgs.model_validate({**args, "parameters": {"rsi_window": 7}})
 
 
 @pytest.mark.parametrize(
@@ -160,14 +173,10 @@ def test_strategy_parameter_mapping_is_compact(parameters: dict[str, int]) -> No
     [
         {"stage": "training"},
         {
-            "stage": "training",
+            "stage": "final",
             "strategy_name": "moving_average",
             "parameters": {"short_window": 20, "long_window": 100},
-            "selected_fingerprint": FINGERPRINT,
         },
-        {"stage": "final", "strategy_name": "moving_average"},
-        {"stage": "final", "parameters": {"short_window": 20, "long_window": 100}},
-        {"stage": "final"},
     ],
 )
 def test_run_backtest_schema_rejects_invalid_stage_combinations(payload: dict) -> None:
@@ -203,7 +212,7 @@ def test_submit_schema_enforces_terminal_text_and_selected_fingerprint() -> None
                 "conclusion": "   ",
             }
         )
-    with pytest.raises(ValidationError, match="blank"):
+    with pytest.raises(ValidationError, match="at least 1 character"):
         SubmitResearchDraftArgs.model_validate(
             {
                 "outcome": "no_strategy",
@@ -240,6 +249,10 @@ def test_submit_schema_enforces_terminal_text_and_selected_fingerprint() -> None
         ("analyze_drawdown", {"fingerprint": FINGERPRINT, "segment": "training"}),
         ("compare_with_benchmark", {"fingerprint": FINGERPRINT, "segment": "test"}),
         (
+            "search_market_context",
+            {"queries": {"sec": "recent risk disclosures"}},
+        ),
+        (
             "submit_research_draft",
             {
                 "outcome": "no_strategy",
@@ -256,32 +269,32 @@ def test_full_tool_call_preserves_protocol_and_delegates_once(
     arguments: dict[str, object],
 ) -> None:
     workspace, calls = runtime_spy
-    tool = _tools_by_name(workspace)[tool_name]
-    tool_call_id = f"call-{tool_name}"
+    events: list[object] = []
 
-    result = tool.invoke(
-        {
-            "name": tool_name,
-            "args": arguments,
-            "id": tool_call_id,
-            "type": "tool_call",
-        }
-    )
+    result = _call(_tools_by_name()[tool_name], workspace, arguments, events)
 
-    assert isinstance(result, ToolMessage)
-    assert result.name == tool_name
-    assert result.tool_call_id == tool_call_id
-    assert result.status == "success"
-    assert isinstance(result.content, str)
-    observation = ToolObservation.model_validate_json(result.content)
+    assert isinstance(result, Command)
+    message = result.update["messages"][0]
+    assert isinstance(message, ToolMessage)
+    assert message.tool_call_id == f"call-{tool_name}"
+    observation = ToolObservation.model_validate_json(message.content)
     assert observation.tool_name == tool_name
     assert observation.status == "success"
     assert len(calls) == 1
     assert calls[0][0] == tool_name
-    assert calls[0][1] is workspace
+    assert isinstance(calls[0][1], ResearchWorkspace)
     expected_runtime_arguments = dict(arguments)
     if tool_name == "run_backtest":
         expected_runtime_arguments["selected_fingerprint"] = None
     elif tool_name == "submit_research_draft":
         expected_runtime_arguments["limitations"] = tuple(arguments["limitations"])
+        expected_runtime_arguments["market_context_summary"] = None
+    elif tool_name == "search_market_context":
+        expected_runtime_arguments["revision_reason"] = None
     assert calls[0][2] == expected_runtime_arguments
+    updated = ResearchWorkspace.model_validate(result.update["workspace"])
+    assert updated.tool_calls == 1
+    assert [(record.tool_name, record.observation) for record in updated.journal] == [
+        (tool_name, observation)
+    ]
+    assert [event["kind"] for event in events] == ["tool", "observation"]

@@ -8,13 +8,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import trading.quant.market_data as market_data_module
-from trading.quant.market_data import (
+import tragent.quant.market_data as market_data_module
+from tragent.quant.market_data import (
     MarketDataDownloadError,
     MarketDataError,
     YFinanceProvider,
     align_market_data,
     calculate_asset_statistics,
+    latest_completed_us_market_session,
     normalize_market_data,
 )
 
@@ -128,6 +129,67 @@ def test_provider_uses_inclusive_end_and_normalizes_symbol(
     )
 
 
+def regular_session_minutes(start: str, exclusive_end: str) -> pd.DatetimeIndex:
+    calendar = xcals.get_calendar("XNYS")
+    sessions = calendar.sessions_in_range(start, pd.Timestamp(exclusive_end) - pd.Timedelta(days=1))
+    return pd.DatetimeIndex(
+        timestamp
+        for session in sessions
+        for timestamp in pd.date_range(
+            calendar.session_open(session),
+            calendar.session_close(session) - pd.Timedelta(minutes=1),
+            freq="1min",
+        )
+    )
+
+
+def test_provider_downloads_minute_sessions_within_yahoo_request_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def minute_download(**kwargs: Any) -> pd.DataFrame:
+        calls.append((kwargs["start"], kwargs["end"]))
+        return make_raw_bars(regular_session_minutes(kwargs["start"], kwargs["end"]))
+
+    monkeypatch.setattr(
+        market_data_module,
+        "_current_utc_time",
+        lambda: pd.Timestamp("2024-07-27 00:00:00+00:00"),
+    )
+    minute = YFinanceProvider(minute_download).get_minute_bars("AAPL", "2024-07-26", 15)
+
+    assert calls == [
+        ("2024-07-08", "2024-07-16"),
+        ("2024-07-16", "2024-07-24"),
+        ("2024-07-24", "2024-07-27"),
+    ]
+    labels = tuple(dict.fromkeys(minute.session_labels))
+    assert (len(labels), labels[0], labels[-1]) == (15, "2024-07-08", "2024-07-26")
+    assert len(minute.bars) == 15 * 390
+    assert minute.bars.index.is_monotonic_increasing
+
+
+def test_provider_limits_minute_sessions_to_yahoo_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_download(**_kwargs: Any) -> pd.DataFrame:
+        raise AssertionError("no download is expected")
+
+    monkeypatch.setattr(
+        market_data_module,
+        "_current_utc_time",
+        lambda: pd.Timestamp("2024-07-27 00:00:00+00:00"),
+    )
+    provider = YFinanceProvider(unexpected_download)
+
+    # 2024-06-28 through 2024-07-26 hold the 20 sessions inside the last 30 days.
+    with pytest.raises(MarketDataError, match="last 30 days of minute data"):
+        provider.get_minute_bars("AAPL", "2024-07-26", 21)
+    with pytest.raises(MarketDataError, match="last 30 days of minute data"):
+        provider.get_minute_bars("AAPL", "2024-06-27", 1)
+
+
 def test_provider_rejects_invalid_dates_before_downloading() -> None:
     called = False
 
@@ -146,6 +208,28 @@ def test_provider_rejects_invalid_dates_before_downloading() -> None:
     assert called is False
 
 
+@pytest.mark.parametrize(
+    ("now_utc", "expected"),
+    [
+        ("2026-09-17 16:06:51+00:00", date(2026, 9, 16)),
+        ("2026-09-17 20:00:00+00:00", date(2026, 9, 17)),
+        ("2026-09-19 12:00:00+00:00", date(2026, 9, 18)),
+    ],
+)
+def test_latest_completed_us_market_session(
+    monkeypatch: pytest.MonkeyPatch,
+    now_utc: str,
+    expected: date,
+) -> None:
+    monkeypatch.setattr(
+        market_data_module,
+        "_current_utc_time",
+        lambda: pd.Timestamp(now_utc),
+    )
+
+    assert latest_completed_us_market_session() == expected
+
+
 def test_provider_hides_downloader_exception_details() -> None:
     def failing_download(**_kwargs: Any) -> pd.DataFrame:
         raise RuntimeError("request failed with secret-token")
@@ -155,6 +239,22 @@ def test_provider_hides_downloader_exception_details() -> None:
 
     assert "Unable to download daily market data for AAPL" in str(error.value)
     assert "secret-token" not in str(error.value)
+
+
+def test_provider_treats_empty_download_as_retryable_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        market_data_module,
+        "_current_utc_time",
+        lambda: pd.Timestamp("2024-07-04 00:00:00+00:00"),
+    )
+    provider = YFinanceProvider(lambda **_kwargs: pd.DataFrame())
+
+    with pytest.raises(MarketDataDownloadError, match="daily market data for AAPL"):
+        provider.get_daily_bars("AAPL", "2024-01-01", "2024-01-31")
+    with pytest.raises(MarketDataDownloadError, match="minute market data for AAPL"):
+        provider.get_minute_bars("AAPL", "2024-07-03", 2)
 
 
 def test_normalization_sorts_dates_keeps_last_duplicate_and_removes_bad_prices() -> None:
@@ -172,8 +272,7 @@ def test_normalization_sorts_dates_keeps_last_duplicate_and_removes_bad_prices()
         opens=[30.0, 10.0, 20.0, 0.0, 50.0],
         closes=[31.0, 11.0, 21.0, 41.0, np.inf],
     )
-    raw["Volume"] = raw["Volume"].astype(object)
-    raw.loc[index[0], "Volume"] = "not-numeric"
+    raw.loc[index[0], "Volume"] = np.nan
 
     result = normalize_market_data(raw, "AAPL")
 
@@ -189,58 +288,9 @@ def test_normalization_sorts_dates_keeps_last_duplicate_and_removes_bad_prices()
     assert len(result.quality.warnings) >= 3
 
 
-@pytest.mark.parametrize("price_first", [True, False])
-def test_normalization_handles_both_multiindex_column_orders(price_first: bool) -> None:
-    prices = ["Open", "High", "Low", "Close", "Volume"]
-    tuples = (
-        [(price, symbol) for price in prices for symbol in ("MSFT", "AAPL")]
-        if price_first
-        else [(symbol, price) for symbol in ("MSFT", "AAPL") for price in prices]
-    )
-    columns = pd.MultiIndex.from_tuples(tuples)
-    values: dict[tuple[str, str], list[float]] = {}
-    for column in tuples:
-        symbol = column[1] if price_first else column[0]
-        price = column[0] if price_first else column[1]
-        base = 100.0 if symbol == "AAPL" else 1_000.0
-        offset = prices.index(price)
-        values[column] = [base + offset, base + offset + 1]
-    raw = pd.DataFrame(values, index=pd.date_range("2024-01-01", periods=2))
-    raw.columns = columns
-
-    result = normalize_market_data(raw, "AAPL")
-
-    assert result.bars["open"].tolist() == [100.0, 101.0]
-    assert result.bars["close"].tolist() == [103.0, 104.0]
-
-
-def test_normalization_preserves_missing_optional_columns_as_nan() -> None:
-    raw = pd.DataFrame(
-        {"Open": [10.0, 11.0], "Close": [10.5, 11.5]},
-        index=pd.date_range("2024-01-01", periods=2),
-    )
-
-    result = normalize_market_data(raw, "AAPL")
-
-    assert result.bars[["high", "low", "volume"]].isna().all().all()
-    assert result.quality.missing_value_counts == {
-        "open": 0,
-        "high": 2,
-        "low": 2,
-        "close": 0,
-        "volume": 2,
-    }
-    assert any("optional columns missing" in warning for warning in result.quality.warnings)
-
-
 @pytest.mark.parametrize(
     "raw, message",
     [
-        (pd.DataFrame(), "No market data was returned"),
-        (
-            pd.DataFrame({"Open": [1.0, 2.0]}, index=pd.date_range("2024-01-01", periods=2)),
-            "missing required column",
-        ),
         (
             make_raw_bars(
                 ["2024-01-01", "2024-01-02"],

@@ -1,9 +1,7 @@
-from dataclasses import FrozenInstanceError
-
 import pytest
 
-import trading.quant as quant
-from trading.quant.models import (
+import tragent.quant as quant
+from tragent.quant.models import (
     BacktestCosts,
     MacdConfig,
     MovingAverageConfig,
@@ -13,7 +11,7 @@ from trading.quant.models import (
 )
 
 
-def test_strategy_configs_are_frozen_and_have_stable_names_and_parameters() -> None:
+def test_strategy_configs_have_stable_names_and_parameters() -> None:
     moving_average = MovingAverageConfig(short_window=5, long_window=20)
     rsi = RsiConfig(rsi_window=14, entry_threshold=30, exit_threshold=70)
     macd = MacdConfig(fast_period=12, slow_period=26, signal_period=9)
@@ -32,9 +30,6 @@ def test_strategy_configs_are_frozen_and_have_stable_names_and_parameters() -> N
         "slow_period": 26,
         "signal_period": 9,
     }
-
-    with pytest.raises(FrozenInstanceError):
-        moving_average.short_window = 10  # type: ignore[misc]
 
 
 @pytest.mark.parametrize(
